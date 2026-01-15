@@ -16,6 +16,7 @@ import habitat
 import numpy as np
 import quaternion
 import torch
+from peft import PeftModel
 import tqdm
 from depth_camera_filtering import filter_depth
 from habitat.config.default import get_agent_config
@@ -28,7 +29,7 @@ from habitat.tasks.nav.shortest_path_follower import ShortestPathFollower
 from habitat.utils.visualizations.utils import images_to_video, observations_to_image
 from habitat_baselines.config.default import get_config as get_habitat_config
 from PIL import Image
-from transformers import AutoProcessor, Qwen2_5_VLForConditionalGeneration
+from transformers import AutoProcessor, Qwen2_5_VLForConditionalGeneration, Qwen3VLForConditionalGeneration
 
 from internnav.configs.evaluator import EvalCfg
 from internnav.evaluator import DistributedEvaluator, Evaluator
@@ -106,8 +107,15 @@ class HabitatVLNEvaluator(DistributedEvaluator):
         # ------------------------------------- model ------------------------------------------
         self.model_args = argparse.Namespace(**cfg.agent.model_settings)
 
-        processor = AutoProcessor.from_pretrained(self.model_args.model_path)
-        processor.tokenizer.padding_side = 'left'
+        # 对于LoRA模型，从基座模型路径加载processor
+        use_lora = getattr(self.model_args, 'use_lora', False)
+        processor_path = getattr(self.model_args, 'base_model_path', self.model_args.model_path) if use_lora else self.model_args.model_path
+        processor = AutoProcessor.from_pretrained(processor_path)
+        # 兼容Qwen3 (AutoProcessor直接返回tokenizer) 和 Qwen2.5_VL (有.tokenizer属性)
+        if hasattr(processor, 'tokenizer'):
+            processor.tokenizer.padding_side = 'left'
+        else:
+            processor.padding_side = 'left'
 
         device = torch.device(f"cuda:{self.local_rank}")
         if self.model_args.mode == 'dual_system':
@@ -118,12 +126,43 @@ class HabitatVLNEvaluator(DistributedEvaluator):
                 device_map={"": device},
             )
         elif self.model_args.mode == 'system2':
-            model = Qwen2_5_VLForConditionalGeneration.from_pretrained(
-                self.model_args.model_path,
-                torch_dtype=torch.bfloat16,
-                attn_implementation="flash_attention_2",
-                device_map={"": device},
-            )
+            # 支持LoRA模型加载
+            use_lora = getattr(self.model_args, 'use_lora', False)
+            if use_lora:
+                base_model_path = getattr(self.model_args, 'base_model_path', None)
+                if base_model_path is None:
+                    raise ValueError("use_lora=True requires base_model_path to be set")
+                print(f"Loading LoRA model: base={base_model_path}, adapter={self.model_args.model_path}")
+                # 判断基座模型类型 (Qwen3-VL vs Qwen2.5-VL)
+                from transformers import AutoConfig
+                base_config = AutoConfig.from_pretrained(base_model_path, trust_remote_code=True)
+                model_type = getattr(base_config, 'model_type', '')
+                print(f"Base model type: {model_type}")
+                if 'qwen3' in model_type.lower():
+                    base_model = Qwen3VLForConditionalGeneration.from_pretrained(
+                        base_model_path,
+                        torch_dtype=torch.bfloat16,
+                        attn_implementation="flash_attention_2",
+                        device_map={"": device},
+                    )
+                else:
+                    base_model = Qwen2_5_VLForConditionalGeneration.from_pretrained(
+                        base_model_path,
+                        torch_dtype=torch.bfloat16,
+                        attn_implementation="flash_attention_2",
+                        device_map={"": device},
+                    )
+                # 加载LoRA adapter
+                model = PeftModel.from_pretrained(base_model, self.model_args.model_path)
+                model = model.merge_and_unload()  # 合并LoRA权重以获得更好的推理性能
+                print("LoRA weights merged successfully")
+            else:
+                model = Qwen2_5_VLForConditionalGeneration.from_pretrained(
+                    self.model_args.model_path,
+                    torch_dtype=torch.bfloat16,
+                    attn_implementation="flash_attention_2",
+                    device_map={"": device},
+                )
         else:
             raise ValueError(f"Invalid mode: {self.model_args.mode}")
 
@@ -132,6 +171,8 @@ class HabitatVLNEvaluator(DistributedEvaluator):
 
         self.model = model
         self.processor = processor
+        # 统一的tokenizer引用，兼容Qwen3和Qwen2.5_VL
+        self.tokenizer = processor.tokenizer if hasattr(processor, "tokenizer") else processor
 
         # refactor: this part used in three places
         prompt = "You are an autonomous navigation assistant. Your task is to <instruction>. Where should you go next to stay on track? Please output the next waypoint\'s coordinates in the image. Please output STOP when you have successfully completed the task."
@@ -412,7 +453,7 @@ class HabitatVLNEvaluator(DistributedEvaluator):
                             return_dict_in_generate=True,
                         ).sequences
 
-                    llm_outputs = self.processor.tokenizer.decode(
+                    llm_outputs = self.tokenizer.decode(
                         output_ids[0][inputs.input_ids.shape[1] :], skip_special_tokens=True
                     )
                     print('step_id:', step_id, 'output text:', llm_outputs)
@@ -745,7 +786,7 @@ class HabitatVLNEvaluator(DistributedEvaluator):
                             return_dict_in_generate=True,
                         ).sequences
 
-                    llm_outputs = self.processor.tokenizer.decode(
+                    llm_outputs = self.tokenizer.decode(
                         output_ids[0][inputs.input_ids.shape[1] :], skip_special_tokens=True
                     )
                     print('step_id:', step_id, 'output text:', llm_outputs)

@@ -12,7 +12,9 @@ from transformers.models.qwen2_vl.modeling_qwen2_vl import (
     Qwen2VisionTransformerPretrainedModel,
     Qwen2VLModel,
 )
-from transformers.trainer import ALL_LAYERNORM_LAYERS, get_parameter_names
+from transformers.trainer import get_parameter_names
+import torch.nn as nn
+ALL_LAYERNORM_LAYERS = [nn.LayerNorm]
 
 
 def _flash_attention_forward(

@@ -10,6 +10,17 @@ class ModelArguments:
     tune_mm_llm: bool = field(default=False)
     tune_mm_mlp: bool = field(default=False)
     tune_mm_vision: bool = field(default=False)
+    
+    # LoRA相关参数
+    use_lora: bool = field(default=False, metadata={"help": "Whether to use LoRA for attention layers"})
+    lora_r: int = field(default=64, metadata={"help": "LoRA rank"})
+    lora_alpha: int = field(default=128, metadata={"help": "LoRA alpha"})
+    lora_dropout: float = field(default=0.05, metadata={"help": "LoRA dropout"})
+    lora_target_modules: Optional[str] = field(
+        default="q_proj,k_proj,v_proj,o_proj,gate_proj,up_proj,down_proj",
+        metadata={"help": "Comma-separated list of LoRA target modules"}
+    )
+    lora_bias: str = field(default="none", metadata={"help": "LoRA bias type: none, all, lora_only"})
 
     system1: Optional[str] = field(default='nextdit')
     n_query: int = field(default=4)

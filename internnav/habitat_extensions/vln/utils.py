@@ -88,6 +88,12 @@ def pixel_to_gps(pixel, depth, intrinsic, tf_camera_to_episodic):
         (x, y): (x, y) coordinates in the episodic frame
     '''
     v, u = pixel
+    # 安全边界检查：裁剪坐标到有效范围（防止模型幻觉输出越界坐标）
+    h, w = depth.shape
+    if v >= h or u >= w or v < 0 or u < 0:
+        print(f'WARNING: pixel coordinate out of bounds: v={v}, u={u}, depth.shape={depth.shape}. Clipping to valid range.')
+        v = max(0, min(v, h - 1))
+        u = max(0, min(u, w - 1))
     z = depth[v, u]
     print("depth: ", z)
 

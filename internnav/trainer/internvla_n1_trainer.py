@@ -32,8 +32,8 @@ from qwenvl_base import replace_qwen2_vl_attention_class
 from transformers import (
     AutoProcessor,
     Qwen2_5_VLForConditionalGeneration,
-    Qwen2VLForConditionalGeneration,
-    Qwen2VLImageProcessor,
+    Qwen3VLForConditionalGeneration,
+
     Trainer,
 )
 
@@ -44,6 +44,9 @@ from internnav.trainer.internvla_n1_argument import (
     ModelArguments,
     TrainingArguments,
 )
+
+# LoRA相关导入
+from peft import LoraConfig, get_peft_model, TaskType
 
 
 def safe_save_model_for_hf_trainer(trainer: transformers.Trainer, output_dir: str):
@@ -75,6 +78,92 @@ def smart_tokenizer_and_embedding_resize(
         input_embeddings[-num_new_tokens:] = input_embeddings_avg
 
 
+
+def apply_lora_to_qwen3vl(model, model_args):
+    """
+    对Qwen3VL模型应用LoRA微调策略:
+    - 支持配置 target_modules
+    - 支持冻结 Vision Tower (通过 tune_mm_vision=False)
+    - Merger/Projector: 全参微调
+    """
+    # 先冻结所有参数
+    for param in model.parameters():
+        param.requires_grad = False
+    
+    # 从参数获取target_modules配置
+    lora_target_modules_str = getattr(model_args, 'lora_target_modules', 
+        "q_proj,k_proj,v_proj,o_proj,gate_proj,up_proj,down_proj")
+    
+    # 解析target_modules
+    if lora_target_modules_str == "all-linear":
+        # all-linear: 只包含LLM的线性层
+        target_modules = [
+            "q_proj", "k_proj", "v_proj", "o_proj",
+            "gate_proj", "up_proj", "down_proj"
+        ]
+    else:
+        target_modules = [m.strip() for m in lora_target_modules_str.split(",")]
+    
+    # 如果需要训练视觉塔，添加视觉层模块
+    if getattr(model_args, 'tune_mm_vision', False):
+        vision_modules = ["qkv", "proj", "fc1", "fc2"]
+        target_modules = list(set(target_modules + vision_modules))
+    
+    # 获取bias配置
+    lora_bias = getattr(model_args, 'lora_bias', 'none')
+    
+    lora_config = LoraConfig(
+        r=model_args.lora_r,
+        lora_alpha=model_args.lora_alpha,
+        target_modules=target_modules,
+        modules_to_save=["merger"],  # merger保持全参微调
+        lora_dropout=model_args.lora_dropout,
+        bias=lora_bias,
+        task_type=TaskType.CAUSAL_LM,
+    )
+    
+    # 应用LoRA
+    model = get_peft_model(model, lora_config)
+    
+    # 确保Merger/Projector是全参微调
+    for name, param in model.named_parameters():
+        if "merger" in name and "lora" not in name.lower():
+            param.requires_grad = True
+    
+    # 确保所有norm层可训练
+    for name, param in model.named_parameters():
+        if "norm" in name.lower() or "layernorm" in name.lower():
+            param.requires_grad = True
+    
+    # 打印可训练参数信息
+    model.print_trainable_parameters()
+    
+    # 打印详细的参数训练状态
+    if torch.distributed.get_rank() == 0:
+        print("")
+        print("=" * 80)
+        print("LoRA Configuration Summary (V2):")
+        print("=" * 80)
+        print(f"LoRA Rank: {model_args.lora_r}")
+        print(f"LoRA Alpha: {model_args.lora_alpha}")
+        print(f"LoRA Dropout: {model_args.lora_dropout}")
+        print(f"LoRA Bias: {lora_bias}")
+        print(f"Target Modules: {target_modules}")
+        print("")
+        print("Training Status:")
+        print(f"  - Vision Tower LoRA: {'Enabled' if getattr(model_args, 'tune_mm_vision', False) else 'FROZEN'}")
+        print("  - LLM Attention: LoRA (q/k/v/o_proj)")
+        print("  - LLM MLP: LoRA (gate/up/down_proj)")
+        print("  - All Norms: Full fine-tuning")
+        print("  - Merger/Projector: Full fine-tuning")
+        print("=" * 80)
+        print("")
+    
+    return model
+
+
+
+
 def set_model(model_args, model):
     if model_args.tune_mm_vision:
         for n, p in model.visual.named_parameters():
@@ -97,7 +186,6 @@ def set_model(model_args, model):
     else:
         for n, p in model.model.named_parameters():
             p.requires_grad = False
-        # model.lm_head.requires_grad = False
         for n, p in model.lm_head.named_parameters():
             p.requires_grad = False
 
@@ -146,6 +234,9 @@ def train(attn_implementation="flash_attention_2"):
     else:
         data_args.transform_train = v2.Resize((data_args.resize_h, data_args.resize_w))
 
+    # 检查是否使用LoRA
+    use_lora = getattr(model_args, 'use_lora', False)
+
     if 'internvla-n1-system2' in model_args.model_name_or_path.lower():
         model = InternVLAN1ForCausalLM.from_pretrained(
             model_args.model_name_or_path,
@@ -169,16 +260,16 @@ def train(attn_implementation="flash_attention_2"):
         ).image_processor
         data_args.model_type = "qwen2.5vl"
     else:
-        model = Qwen2VLForConditionalGeneration.from_pretrained(
+        model = Qwen3VLForConditionalGeneration.from_pretrained(
             model_args.model_name_or_path,
             cache_dir=training_args.cache_dir,
             attn_implementation=attn_implementation,
             torch_dtype=(torch.bfloat16 if training_args.bf16 else None),
         )
-        data_args.image_processor = Qwen2VLImageProcessor.from_pretrained(
+        data_args.image_processor = AutoProcessor.from_pretrained(
             model_args.model_name_or_path,
-        )
-        data_args.model_type = "qwen2vl"
+        ).image_processor
+        data_args.model_type = "qwen3vl"
 
     if data_args.data_flatten:
         replace_qwen2_vl_attention_class()
@@ -204,11 +295,28 @@ def train(attn_implementation="flash_attention_2"):
 
     if data_args.model_type == "internvla-n1":
         model.get_model().initialize_vision_modules(model_args=model_args)
-    set_model(model_args, model)
+    
+    # 应用LoRA或全参微调
+    if use_lora and data_args.model_type == "qwen3vl":
+        print("=" * 50)
+        print("Using LoRA for attention layers, full fine-tuning for MLP/Merger/Norms")
+        print("=" * 50)
+        model = apply_lora_to_qwen3vl(model, model_args)
+    else:
+        set_model(model_args, model)
 
+    # 关闭视觉层的梯度检查点以节省计算和加速训练
+    if hasattr(model, 'visual') and hasattr(model.visual, 'gradient_checkpointing'):
+        model.visual.gradient_checkpointing = False
+        if torch.distributed.get_rank() == 0:
+            print("=" * 50)
+            print("Vision Tower Gradient Checkpointing: DISABLED")
+            print("=" * 50)
     if torch.distributed.get_rank() == 0:
-        model.visual.print_trainable_parameters()
-        model.model.print_trainable_parameters()
+        if hasattr(model, 'visual') and hasattr(model.visual, 'print_trainable_parameters'):
+            model.visual.print_trainable_parameters()
+        if hasattr(model, 'model') and hasattr(model.model, 'print_trainable_parameters'):
+            model.model.print_trainable_parameters()
 
     if data_args.data_packing:
         data_module = make_supervised_data_module_packed(tokenizer=tokenizer, data_args=data_args)  # noqa: F821

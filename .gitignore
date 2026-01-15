@@ -152,3 +152,17 @@ checkpoints
 internnav/model/basemodel/LongCLIP/
 .gradio/
 result/
+
+# Large files - models, weights, data
+*.pt
+*.bin
+*.safetensors
+*.ckpt
+output_dir*/
+traj_data/
+habitat-lab/
+*.bak
+train_log.txt
+
+# Checkpoints
+checkpoint-*/

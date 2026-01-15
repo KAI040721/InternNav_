@@ -20,13 +20,14 @@ import torch
 
 import transformers
 from transformers.trainer import (
-    ALL_LAYERNORM_LAYERS,
     TRAINER_STATE_NAME,
     TrainerState,
     get_last_checkpoint,
     get_parameter_names,
     is_sagemaker_mp_enabled,
 )
+import torch.nn as nn
+ALL_LAYERNORM_LAYERS = [nn.LayerNorm]
 
 
 class BaseTrainer(transformers.Trainer):
