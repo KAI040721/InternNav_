@@ -305,7 +305,9 @@ class LazySupervisedDataset(Dataset):
                 annotations = json.load(open(data["annotation_path"], "r"))
             sampling_rate = data.get("sampling_rate", 1.0)
             if sampling_rate < 1.0:
-                annotations = random.sample(annotations, int(len(annotations) * sampling_rate))
+                # 使用固定种子确保所有 GPU 进程采样到相同的数据
+                rng = random.Random(42)
+                annotations = rng.sample(annotations, int(len(annotations) * sampling_rate))
                 print(f"sampling {len(annotations)} examples from dataset {data}")
             else:
                 rank0_print(f"dataset name: {data}")
@@ -315,7 +317,7 @@ class LazySupervisedDataset(Dataset):
 
         rank0_print(f"Total training samples: {len(list_data_dict)}")
 
-        random.shuffle(list_data_dict)  # Randomly shuffle the data for training
+        rng = random.Random(42); rng.shuffle(list_data_dict)  # Shuffle with fixed seed for distributed training
 
         rank0_print("Formatting inputs...Skip in lazy mode")
         self.tokenizer = tokenizer
@@ -331,6 +333,13 @@ class LazySupervisedDataset(Dataset):
 
     @property
     def lengths(self):
+        # 优先使用预计算的 length 字段 (轨迹长度) - 用于 group_by_length 分组
+        if self.list_data_dict and "length" in self.list_data_dict[0]:
+            return [sample.get("length", 1) for sample in self.list_data_dict]
+        # 使用预计算的 num_tokens
+        if self.list_data_dict and "num_tokens" in self.list_data_dict[0]:
+            return [sample.get("num_tokens", 1) for sample in self.list_data_dict]
+        # 回退到计算方式
         length_list = []
         for sample in self.list_data_dict:
             img_tokens = 128 if "image" in sample else 0
@@ -939,7 +948,9 @@ class NavPixelGoalDataset(Dataset):
                 list_data_dict += turn_list
                 list_data_dict += stop_list * 5
             if sampling_rate < 1.0:
-                list_data_dict = random.sample(list_data_dict, int(len(list_data_dict) * sampling_rate))
+                # 使用固定种子确保所有 GPU 进程采样到相同的数据
+                rng = random.Random(42)
+                list_data_dict = rng.sample(list_data_dict, int(len(list_data_dict) * sampling_rate))
                 print(f"sampling {len(list_data_dict)} examples from dataset {data}")
             else:
                 rank0_print(f"dataset name: {data}")
@@ -1352,7 +1363,7 @@ class CombinedDataset(Dataset):
             self.shuffle()
 
     def shuffle(self):
-        np.random.shuffle(self.indices)
+        np.random.seed(42); np.random.shuffle(self.indices)
 
     def _map_index(self, idx):
         return self.indices[idx]
