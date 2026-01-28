@@ -94,7 +94,6 @@ class VLLNDataset(Dataset):
 
         for data in dataset_list:
             sampling_rate = data.get("sampling_rate", 1.0)
-            rng = random.Random(42)  # Fixed seed for reproducibility
             height = data.get("height", None)
             pitch_1 = data.get("pitch_1", None)
             pitch_2 = data.get("pitch_2", None)
@@ -261,7 +260,8 @@ class VLLNDataset(Dataset):
                 list_data_dict += stop_list * 10
                 list_data_dict += dialog_list * 10
             if sampling_rate < 1.0:
-                list_data_dict = rng.sample(list_data_dict, int(len(list_data_dict) * sampling_rate))
+                random.seed(42)  # 固定种子确保所有进程采样到相同数据
+                list_data_dict = random.sample(list_data_dict, int(len(list_data_dict) * sampling_rate))
                 print(f"sampling {len(list_data_dict)} examples from dataset {data}")
             else:
                 rank0_print(f"dataset name: {data}")
