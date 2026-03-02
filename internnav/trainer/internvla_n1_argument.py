@@ -24,6 +24,14 @@ class ModelArguments:
 
     system1: Optional[str] = field(default='nextdit')
     n_query: int = field(default=4)
+    
+    # Compressor相关参数
+    use_compressor: bool = field(default=False, metadata={"help": "Whether to use visual token compressor"})
+    compressor_stage: str = field(default="1a", metadata={"help": "Compressor training stage: 1a, 1b, 1c"})
+    compressor_n_queries: int = field(default=16, metadata={"help": "Number of compressed tokens per frame"})
+    compressor_d_bottleneck: int = field(default=512, metadata={"help": "Bottleneck dimension"})
+    compressor_n_layers: int = field(default=2, metadata={"help": "Number of cross-attention layers"})
+    compressor_n_heads: int = field(default=8, metadata={"help": "Number of attention heads"})
 
 
 @dataclass
