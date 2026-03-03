@@ -53,7 +53,7 @@ from transformers import (
 
 from internnav.dataset.internvla_n1_lerobot_dataset import make_supervised_data_module
 from internnav.model.basemodel.internvla_n1.internvla_n1 import InternVLAN1ForCausalLM
-from internnav.model.compressor_wrapper import apply_compressor_stage1a
+from internnav.model.compressor_wrapper import apply_compressor_stage1a, apply_compressor_stage2, apply_compressor_stage3b
 from internnav.trainer.internvla_n1_argument import (
     DataArguments,
     ModelArguments,
@@ -385,7 +385,21 @@ def train(attn_implementation="flash_attention_2"):
             'n_heads': model_args.compressor_n_heads,
             'n_layers': model_args.compressor_n_layers,
         }
-        model = apply_compressor_stage1a(model, compressor_config)
+        if model_args.compressor_stage == "3b":
+            model = apply_compressor_stage3b(
+                model, compressor_config,
+                stage1a_checkpoint=model_args.compressor_stage1a_checkpoint,
+                lora_r=model_args.lora_r,
+                lora_alpha=model_args.lora_alpha,
+                lora_dropout=model_args.lora_dropout,
+            )
+        elif model_args.compressor_stage == "2":
+            model = apply_compressor_stage2(
+                model, compressor_config,
+                stage1a_checkpoint=model_args.compressor_stage1a_checkpoint,
+            )
+        else:
+            model = apply_compressor_stage1a(model, compressor_config)
         # Pass compressor settings to data_args
         data_args.use_compressor = True
         data_args.compressor_n_queries = model_args.compressor_n_queries

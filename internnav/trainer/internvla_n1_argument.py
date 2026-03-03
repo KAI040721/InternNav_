@@ -32,6 +32,7 @@ class ModelArguments:
     compressor_d_bottleneck: int = field(default=512, metadata={"help": "Bottleneck dimension"})
     compressor_n_layers: int = field(default=2, metadata={"help": "Number of cross-attention layers"})
     compressor_n_heads: int = field(default=8, metadata={"help": "Number of attention heads"})
+    compressor_stage1a_checkpoint: Optional[str] = field(default=None, metadata={"help": "Path to Stage 1a checkpoint for Stage 2 training"})
 
 
 @dataclass

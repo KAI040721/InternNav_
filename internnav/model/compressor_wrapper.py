@@ -19,6 +19,13 @@ Batch>1 support:
   samples are in the batch.
 
 Stage 1a Strategy:
+
+Stage 2 Strategy:
+  - Load Compressor weights from Stage 1a checkpoint
+  - Train: Compressor (base lr) + Merger last projection (mm_projector_lr) +
+           DeepStack merger last projection + merger-related norms
+  - Freeze: ViT backbone, LLM, lm_head, embed_tokens
+  - History deepstack: zeros (same as Stage 1a, method X)
   - Freeze ALL original params (ViT + LLM)
   - Train ONLY Compressor (~10.5M params)
   - History frames: primary tokens compressed 144→16, deepstack set to zeros
@@ -477,4 +484,317 @@ def apply_compressor_stage1a(model, compressor_config=None):
         print("  History DeepStack:   Set to ZEROS (disabled)")
         print("=" * 80)
 
+    return model
+
+
+def apply_compressor_stage2(model, compressor_config=None, stage1a_checkpoint=None):
+    """
+    Stage 2: Fine-tune Compressor + Merger last projection layers.
+    
+    Load Compressor weights from Stage 1a checkpoint, then:
+      - Freeze: ViT backbone, LLM, lm_head, embed_tokens
+      - Train:  Compressor (base lr=5e-4)
+                merger.linear_fc2 + bias (mm_projector_lr=1e-5)
+                deepstack_merger_list[*].linear_fc2 + bias (mm_projector_lr=1e-5)
+                merger.norm + deepstack norms (mm_projector_lr=1e-5)
+      - History deepstack: zeros (same as Stage 1a)
+    
+    The create_optimizer in qwenvl_base.py routes:
+      - params with "merger" in name → mm_projector_lr group
+      - other params (compressor) → base learning_rate group
+    """
+    # Step 1: Freeze everything
+    for param in model.parameters():
+        param.requires_grad = False
+    
+    # Step 2: Attach compressor (same as Stage 1a)
+    model = attach_compressor(model, compressor_config)
+    
+    # Step 3: Load Compressor weights from Stage 1a checkpoint
+    if stage1a_checkpoint is not None:
+        import os
+        from safetensors import safe_open
+        
+        ckpt_path = os.path.join(stage1a_checkpoint, "model.safetensors")
+        if not os.path.exists(ckpt_path):
+            raise FileNotFoundError(
+                f"Stage 1a checkpoint not found: {ckpt_path}"
+            )
+        
+        comp_state = {}
+        with safe_open(ckpt_path, framework="pt") as f:
+            for key in f.keys():
+                if key.startswith("compressor."):
+                    comp_state[key.replace("compressor.", "")] = f.get_tensor(key)
+        
+        missing, unexpected = model.compressor.load_state_dict(comp_state, strict=False)
+        
+        if torch.distributed.is_initialized():
+            rank = torch.distributed.get_rank()
+        else:
+            rank = 0
+        if rank == 0:
+            print(f"[Stage 2] Loaded Compressor from: {ckpt_path}")
+            print(f"  Loaded {len(comp_state)} tensors")
+            if missing:
+                print(f"  WARNING missing keys: {missing}")
+            if unexpected:
+                print(f"  WARNING unexpected keys: {unexpected}")
+    else:
+        raise ValueError("stage1a_checkpoint is required for Stage 2")
+    
+    # Step 4: Unfreeze Compressor (all params)
+    for param in model.compressor.parameters():
+        param.requires_grad = True
+    
+    # Step 5: Unfreeze Merger last projection + norms
+    # merger.linear_fc2 (the last projection: 4096 → 2048)
+    for name, param in model.model.visual.merger.named_parameters():
+        if "linear_fc2" in name:
+            param.requires_grad = True
+        if "norm" in name.lower():
+            param.requires_grad = True
+    
+    # deepstack_merger_list[*].linear_fc2 + norms
+    for name, param in model.model.visual.deepstack_merger_list.named_parameters():
+        if "linear_fc2" in name:
+            param.requires_grad = True
+        if "norm" in name.lower():
+            param.requires_grad = True
+    
+    # Step 6: Enable input require grads (needed for gradient flow)
+    if hasattr(model, 'enable_input_require_grads'):
+        model.enable_input_require_grads()
+    else:
+        def _make_inputs_require_grad(module, input, output):
+            output.requires_grad_(True)
+        model.get_input_embeddings().register_forward_hook(
+            _make_inputs_require_grad
+        )
+    
+    # Step 7: Print configuration
+    total_params = sum(p.numel() for p in model.parameters())
+    trainable_params = sum(
+        p.numel() for p in model.parameters() if p.requires_grad
+    )
+    
+    if torch.distributed.is_initialized():
+        rank = torch.distributed.get_rank()
+    else:
+        rank = 0
+    
+    if rank == 0:
+        # Detailed stats
+        comp_params = sum(p.numel() for p in model.compressor.parameters() if p.requires_grad)
+        merger_params = sum(
+            p.numel() for n, p in model.model.visual.merger.named_parameters()
+            if p.requires_grad
+        )
+        ds_params = sum(
+            p.numel() for n, p in model.model.visual.deepstack_merger_list.named_parameters()
+            if p.requires_grad
+        )
+        
+        print("=" * 80)
+        print("Compressor Stage 2 Configuration:")
+        print("=" * 80)
+        print(f"Total params: {total_params / 1e6:.1f}M")
+        print(
+            f"Trainable params: {trainable_params / 1e6:.2f}M "
+            f"({trainable_params / total_params * 100:.2f}%)"
+        )
+        print("")
+        print("Trainable Components:")
+        print(f"  Compressor:                    {comp_params / 1e6:.2f}M  (base lr)")
+        print(f"  merger.linear_fc2 + norm:      {merger_params / 1e6:.2f}M  (mm_projector_lr)")
+        print(f"  deepstack linear_fc2 + norms:  {ds_params / 1e6:.2f}M  (mm_projector_lr)")
+        print("")
+        print("Freeze Strategy:")
+        print("  ViT backbone:        FROZEN")
+        print("  merger.linear_fc1:   FROZEN")
+        print("  merger.linear_fc2:   TRAINABLE (mm_projector_lr)")
+        print("  merger.norm:         TRAINABLE (mm_projector_lr)")
+        print("  deepstack fc1:       FROZEN")
+        print("  deepstack fc2:       TRAINABLE (mm_projector_lr)")
+        print("  deepstack norms:     TRAINABLE (mm_projector_lr)")
+        print("  LLM:                 FROZEN")
+        print("  lm_head:             FROZEN")
+        print("  embed_tokens:        FROZEN")
+        print("  Compressor:          TRAINABLE (base lr)")
+        print("  History DeepStack:   ZEROS (same as Stage 1a)")
+        print("=" * 80)
+        
+        # List all trainable params for verification
+        print("")
+        print("All trainable parameters:")
+        for n, p in model.named_parameters():
+            if p.requires_grad:
+                print(f"  {n}: {list(p.shape)} ({p.numel()/1e3:.1f}K)")
+        print("")
+    
+    return model
+
+
+def apply_compressor_stage3b(model, compressor_config=None, stage1a_checkpoint=None,
+                              lora_r=32, lora_alpha=64, lora_dropout=0.05):
+    """
+    Stage 3b (方案B): LLM LoRA + Compressor, freeze ViT/Merger.
+    
+    Goal: Verify whether LLM can learn to utilize compressed 16-token
+    history representations. This directly addresses the bottleneck
+    identified in Stage 2 (unfreezing Merger did not reduce loss).
+    
+    Pipeline:
+      1. Freeze all params
+      2. Attach & load Compressor from Stage 1a checkpoint
+      3. Apply LLM-only LoRA (no ViT LoRA, no modules_to_save)
+      4. Unfreeze Compressor
+      → Trainable: Compressor (~10.5M, base lr) + LLM LoRA (~14M, base lr)
+      → Frozen: ViT, Merger, DeepStack, embed_tokens, lm_head
+      → History deepstack: zeros (same as Stage 1a)
+    
+    Order matters: attach_compressor BEFORE peft wrapping, because
+    compressor patches model.model.forward (inner model), and PEFT
+    wraps model.forward (outer model).
+    """
+    from peft import LoraConfig, get_peft_model, TaskType
+    
+    # Step 1: Freeze everything
+    for param in model.parameters():
+        param.requires_grad = False
+    
+    # Step 2: Attach compressor and patch forward (BEFORE PEFT wrapping)
+    model = attach_compressor(model, compressor_config)
+    
+    # Step 3: Load Compressor weights from Stage 1a
+    if stage1a_checkpoint is None:
+        raise ValueError("stage1a_checkpoint is required for Stage 3b")
+    
+    import os
+    from safetensors import safe_open
+    
+    ckpt_path = os.path.join(stage1a_checkpoint, "model.safetensors")
+    if not os.path.exists(ckpt_path):
+        raise FileNotFoundError(f"Stage 1a checkpoint not found: {ckpt_path}")
+    
+    comp_state = {}
+    with safe_open(ckpt_path, framework="pt") as f:
+        for key in f.keys():
+            if key.startswith("compressor."):
+                comp_state[key.replace("compressor.", "")] = f.get_tensor(key)
+    
+    missing, unexpected = model.compressor.load_state_dict(comp_state, strict=False)
+    
+    if torch.distributed.is_initialized():
+        rank = torch.distributed.get_rank()
+    else:
+        rank = 0
+    if rank == 0:
+        print(f"[Stage 3b] Loaded Compressor from: {ckpt_path}")
+        print(f"  Loaded {len(comp_state)} tensors")
+        if missing:
+            print(f"  WARNING missing keys: {missing}")
+        if unexpected:
+            print(f"  WARNING unexpected keys: {unexpected}")
+    
+    # Step 4: Apply LLM-only LoRA
+    # Only target LLM attention + MLP linear layers
+    # Do NOT add ViT modules (qkv, proj) — ViT stays frozen
+    # Do NOT add modules_to_save (merger, embed_tokens, lm_head) — all frozen
+    # Target LLM attention + MLP projections, exclude ViT modules
+    # ViT also has gate_proj/up_proj/down_proj in visual.blocks.*.mlp
+    # Use exclude_modules to prevent LoRA being applied to ViT
+    llm_target_modules = [
+        "q_proj", "k_proj", "v_proj", "o_proj",
+        "gate_proj", "up_proj", "down_proj",
+    ]
+    
+    lora_config = LoraConfig(
+        r=lora_r,
+        lora_alpha=lora_alpha,
+        target_modules=llm_target_modules,
+        exclude_modules=["visual.*"],
+        lora_dropout=lora_dropout,
+        bias="none",
+        task_type=TaskType.CAUSAL_LM,
+    )
+    
+    # Enable input require grads before PEFT (PEFT needs it)
+    if hasattr(model, 'enable_input_require_grads'):
+        model.enable_input_require_grads()
+    else:
+        def _make_inputs_require_grad(module, input, output):
+            output.requires_grad_(True)
+        model.get_input_embeddings().register_forward_hook(
+            _make_inputs_require_grad
+        )
+    
+    model = get_peft_model(model, lora_config)
+    
+    # Step 5: Unfreeze Compressor
+    # After PEFT wrapping, compressor is at model.base_model.model.compressor
+    # but model.compressor still works via __getattr__
+    for name, param in model.named_parameters():
+        if "compressor" in name:
+            param.requires_grad = True
+    
+    # Step 6: Print configuration
+    total_params = sum(p.numel() for p in model.parameters())
+    trainable_params = sum(
+        p.numel() for p in model.parameters() if p.requires_grad
+    )
+    
+    if rank == 0:
+        # Count by component
+        comp_params = 0
+        lora_params = 0
+        other_params = 0
+        for n, p in model.named_parameters():
+            if not p.requires_grad:
+                continue
+            if "compressor" in n:
+                comp_params += p.numel()
+            elif "lora" in n.lower():
+                lora_params += p.numel()
+            else:
+                other_params += p.numel()
+        
+        print("=" * 80)
+        print("Compressor Stage 3b Configuration (方案B):")
+        print("=" * 80)
+        print(f"Total params: {total_params / 1e6:.1f}M")
+        print(f"Trainable params: {trainable_params / 1e6:.2f}M "
+              f"({trainable_params / total_params * 100:.2f}%)")
+        print("")
+        print("Trainable Components:")
+        print(f"  Compressor:          {comp_params / 1e6:.2f}M  (base lr)")
+        print(f"  LLM LoRA (r={lora_r}):    {lora_params / 1e6:.2f}M  (base lr)")
+        if other_params > 0:
+            print(f"  Other:               {other_params / 1e6:.2f}M")
+        print("")
+        print(f"LoRA Config:")
+        print(f"  rank={lora_r}, alpha={lora_alpha}, dropout={lora_dropout}")
+        print(f"  targets: {llm_target_modules}")
+        print(f"  exclude: ['visual.*']")
+        print(f"  bias: none")
+        print("")
+        print("Freeze Strategy:")
+        print("  ViT backbone:        FROZEN (no LoRA)")
+        print("  Merger:              FROZEN")
+        print("  DeepStack Mergers:   FROZEN")
+        print("  LLM layers:          LoRA adapters only")
+        print("  embed_tokens:        FROZEN")
+        print("  lm_head:             FROZEN")
+        print("  Compressor:          TRAINABLE (from Stage 1a)")
+        print("  History DeepStack:   ZEROS (same as Stage 1a)")
+        print("=" * 80)
+        
+        # List all trainable params
+        print("")
+        print("All trainable parameters:")
+        for n, p in model.named_parameters():
+            if p.requires_grad:
+                print(f"  {n}: {list(p.shape)} ({p.numel()/1e3:.1f}K)")
+        print("")
+    
     return model
