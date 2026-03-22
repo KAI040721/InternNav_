@@ -226,18 +226,27 @@ def make_inner_forward(original_inner_forward, compressor, outer_model_ref):
                 image_mask, image_embeds_final
             )
 
-            # Step 6: DeepStack handling
+            # Step 6: DeepStack handling — 历史帧 deepstack 也走 FiLM 压缩
             if all_deepstack is not None and len(all_deepstack) > 0:
                 new_deepstack = []
                 for ds in all_deepstack:
                     ds_per_image = list(torch.split(ds, split_sizes))
                     ds_parts = []
+                    if n_hist > 0:
+                        # 收集历史帧的 deepstack tokens 并压缩
+                        ds_history = torch.stack(
+                            [ds_per_image[i] for i in range(n_total_images) if is_history_image[i]]
+                        )  # [n_hist, T, d_model]
+                        ds_compressed = compressor.compress_frames(
+                            ds_history, instr_emb_single
+                        )  # [n_hist, n_queries, d_model]
+                    hist_counter = 0
                     for i in range(n_total_images):
                         if is_history_image[i]:
-                            # Zero deepstack for history (Stage 1a)
                             ds_parts.append(
-                                ds.new_zeros(compressor.n_queries, ds.shape[-1])
+                                ds_compressed[hist_counter].reshape(-1, ds_compressed.shape[-1])
                             )
+                            hist_counter += 1
                         else:
                             ds_parts.append(ds_per_image[i])
                     new_deepstack.append(torch.cat(ds_parts, dim=0))

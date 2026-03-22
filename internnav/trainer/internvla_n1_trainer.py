@@ -48,6 +48,9 @@ from internnav.trainer.internvla_n1_argument import (
 # LoRA相关导入
 from peft import LoraConfig, get_peft_model, TaskType
 
+# Compressor相关导入
+from internnav.model.compressor_wrapper import attach_compressor
+
 
 def safe_save_model_for_hf_trainer(trainer: transformers.Trainer, output_dir: str):
     """Collects the state dict and dump to disk."""
@@ -287,12 +290,43 @@ def train(attn_implementation="flash_attention_2"):
     if data_args.model_type == "internvla-n1":
         model.get_model().initialize_vision_modules(model_args=model_args)
     
+    # Compressor: 先 attach (monkey-patch forward)，再 apply LoRA
+    use_compressor = getattr(model_args, 'use_compressor', False)
+    if use_compressor and data_args.model_type == "qwen3vl":
+        compressor_config = {
+            'd_model': 2048,  # Qwen3-VL-2B LLM hidden_size
+            'd_bottleneck': model_args.compressor_d_bottleneck,
+            'n_queries': model_args.compressor_n_queries,
+            'n_heads': model_args.compressor_n_heads,
+            'n_layers': model_args.compressor_n_layers,
+        }
+        model = attach_compressor(model, compressor_config)
+        if torch.distributed.get_rank() == 0:
+            comp_params = sum(p.numel() for p in model.compressor.parameters())
+            print("=" * 50)
+            print(f"Compressor attached: {comp_params/1e6:.2f}M params (randomly initialized)")
+            print(f"  d_bottleneck={model_args.compressor_d_bottleneck}, n_queries={model_args.compressor_n_queries}")
+            print("=" * 50)
+        # Pass compressor settings to data_args for dataset
+        data_args.use_compressor = True
+        data_args.compressor_n_queries = model_args.compressor_n_queries
+
     # 应用LoRA或全参微调
     if use_lora and data_args.model_type == "qwen3vl":
         print("=" * 50)
         print("Using Pure LoRA - All base layers frozen, only LoRA adapters trained")
+        if use_compressor:
+            print("+ Compressor (FiLM) jointly trained")
         print("=" * 50)
         model = apply_lora_to_qwen3vl(model, model_args)
+        # LoRA冻结了所有base参数，需要重新unfreeze compressor
+        if use_compressor:
+            for name, param in model.named_parameters():
+                if "compressor" in name:
+                    param.requires_grad = True
+            if torch.distributed.get_rank() == 0:
+                comp_trainable = sum(p.numel() for n, p in model.named_parameters() if "compressor" in n and p.requires_grad)
+                print(f"[Compressor] Re-unfrozen after LoRA: {comp_trainable/1e6:.2f}M trainable")
     else:
         set_model(model_args, model)
 
@@ -332,6 +366,25 @@ def train(attn_implementation="flash_attention_2"):
     model.config.use_cache = True
 
     safe_save_model_for_hf_trainer(trainer=trainer, output_dir=training_args.output_dir)
+
+    # 保存 Compressor 权重 (PEFT save_pretrained 不包含它们)
+    if getattr(model_args, 'use_compressor', False):
+        import torch.distributed as dist
+        if not dist.is_initialized() or dist.get_rank() == 0:
+            base_model = trainer.model
+            # 穿透 DeepSpeed / PEFT wrappers
+            if hasattr(base_model, 'module'):
+                base_model = base_model.module
+            if hasattr(base_model, 'base_model') and hasattr(base_model.base_model, 'model'):
+                base_model = base_model.base_model.model
+            if hasattr(base_model, 'compressor'):
+                from safetensors.torch import save_file
+                comp_state = {k: v.cpu() for k, v in base_model.compressor.state_dict().items()}
+                save_path = os.path.join(training_args.output_dir, 'compressor_film.safetensors')
+                save_file(comp_state, save_path)
+                print(f"[Compressor] Saved {len(comp_state)} tensors to {save_path}")
+            else:
+                print("[Compressor] WARNING: model has no compressor attribute, skipping save")
 
 
 if __name__ == "__main__":

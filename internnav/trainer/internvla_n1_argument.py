@@ -25,6 +25,13 @@ class ModelArguments:
     system1: Optional[str] = field(default='nextdit')
     n_query: int = field(default=4)
 
+    # Compressor相关参数
+    use_compressor: bool = field(default=False, metadata={"help": "Whether to use FiLM compressor for history frame compression"})
+    compressor_d_bottleneck: int = field(default=512, metadata={"help": "Compressor bottleneck dimension"})
+    compressor_n_queries: int = field(default=16, metadata={"help": "Number of query tokens after compression (144->16)"})
+    compressor_n_heads: int = field(default=8, metadata={"help": "Number of attention heads in compressor"})
+    compressor_n_layers: int = field(default=2, metadata={"help": "Number of cross-attention layers in compressor"})
+
 
 @dataclass
 class DataArguments:
