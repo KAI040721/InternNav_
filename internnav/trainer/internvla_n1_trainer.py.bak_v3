@@ -81,12 +81,10 @@ def smart_tokenizer_and_embedding_resize(
 
 def apply_lora_to_qwen3vl(model, model_args):
     """
-    对Qwen3VL模型应用Pure LoRA微调策略:
-    - 冻结所有基础参数，只训练 LoRA adapters
-    - tune_mm_vision=True 时 ViT 也加 LoRA (qkv, proj, fc1, fc2)
-    - Merger/Projector 通过 fc1, fc2 的 LoRA 间接微调
-    - Norms: 全部冻结
-    - 可训练参数: ~39.7M (1.83%)
+    对Qwen3VL模型应用LoRA微调策略:
+    - 支持配置 target_modules
+    - 支持冻结 Vision Tower (通过 tune_mm_vision=False)
+    - Merger/Projector: 全参微调
     """
     # 先冻结所有参数
     for param in model.parameters():
@@ -106,7 +104,7 @@ def apply_lora_to_qwen3vl(model, model_args):
     else:
         target_modules = [m.strip() for m in lora_target_modules_str.split(",")]
     
-    # 如果需要训练视觉塔，添加视觉层模块（含 fc1, fc2 用于覆盖 Merger）
+    # 如果需要训练视觉塔，添加视觉层模块
     if getattr(model_args, 'tune_mm_vision', False):
         vision_modules = ["qkv", "proj", "fc1", "fc2"]
         target_modules = list(set(target_modules + vision_modules))
@@ -118,13 +116,24 @@ def apply_lora_to_qwen3vl(model, model_args):
         r=model_args.lora_r,
         lora_alpha=model_args.lora_alpha,
         target_modules=target_modules,
+        modules_to_save=["merger"],  # merger保持全参微调
         lora_dropout=model_args.lora_dropout,
         bias=lora_bias,
         task_type=TaskType.CAUSAL_LM,
     )
     
-    # 应用LoRA（纯 LoRA，不解冻任何基础参数）
+    # 应用LoRA
     model = get_peft_model(model, lora_config)
+    
+    # 确保Merger/Projector是全参微调
+    for name, param in model.named_parameters():
+        if "merger" in name and "lora" not in name.lower():
+            param.requires_grad = True
+    
+    # 确保所有norm层可训练
+    for name, param in model.named_parameters():
+        if "norm" in name.lower() or "layernorm" in name.lower():
+            param.requires_grad = True
     
     # 打印可训练参数信息
     model.print_trainable_parameters()
@@ -133,7 +142,7 @@ def apply_lora_to_qwen3vl(model, model_args):
     if torch.distributed.get_rank() == 0:
         print("")
         print("=" * 80)
-        print("LoRA Configuration Summary (Pure LoRA):")
+        print("LoRA Configuration Summary (V2):")
         print("=" * 80)
         print(f"LoRA Rank: {model_args.lora_r}")
         print(f"LoRA Alpha: {model_args.lora_alpha}")
@@ -145,8 +154,8 @@ def apply_lora_to_qwen3vl(model, model_args):
         print(f"  - Vision Tower LoRA: {'Enabled' if getattr(model_args, 'tune_mm_vision', False) else 'FROZEN'}")
         print("  - LLM Attention: LoRA (q/k/v/o_proj)")
         print("  - LLM MLP: LoRA (gate/up/down_proj)")
-        print("  - All Norms: FROZEN (LoRA only)")
-        print("  - Merger/Projector: LoRA (fc1, fc2)")
+        print("  - All Norms: Full fine-tuning")
+        print("  - Merger/Projector: Full fine-tuning")
         print("=" * 80)
         print("")
     
@@ -290,7 +299,7 @@ def train(attn_implementation="flash_attention_2"):
     # 应用LoRA或全参微调
     if use_lora and data_args.model_type == "qwen3vl":
         print("=" * 50)
-        print("Using Pure LoRA - All base layers frozen, only LoRA adapters trained")
+        print("Using LoRA for attention layers, full fine-tuning for MLP/Merger/Norms")
         print("=" * 50)
         model = apply_lora_to_qwen3vl(model, model_args)
     else:

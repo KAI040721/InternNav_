@@ -963,9 +963,6 @@ class NavPixelGoalDataset(Dataset):
         ]
         self.data_args = data_args
         self.tokenizer = tokenizer
-        # Compressor support
-        self.use_compressor = getattr(data_args, 'use_compressor', False)
-        self.compressor_n_queries = getattr(data_args, 'compressor_n_queries', 16)
 
     def __len__(self):
         return len(self.list_data_dict)
@@ -1093,33 +1090,9 @@ class NavPixelGoalDataset(Dataset):
             grid_thw_merged = [grid_thw_merged]
             grid_thws = [grid_thws]
 
-        num_history_images = len(history_id)
-
-        if self.use_compressor:
-            # Compressor mode: history frames get compressed tokens, current frames keep original
-            grid_thw_merged_for_tokens = []
-            grid_thws_for_rope = []
-            is_history_list = []
-            for idx_img, merged_thw in enumerate(grid_thw_merged):
-                original_tokens = merged_thw.prod() // self.data_args.image_processor.merge_size**2
-                if idx_img < num_history_images:
-                    # History frame: compressed to n_queries tokens
-                    grid_thw_merged_for_tokens.append(self.compressor_n_queries)
-                    sq = int(self.compressor_n_queries ** 0.5)
-                    grid_thws_for_rope.append(torch.tensor([1, sq, sq], dtype=torch.long))
-                    is_history_list.append(True)
-                else:
-                    # Current frame (and birdseye): original tokens
-                    grid_thw_merged_for_tokens.append(int(original_tokens.item()))
-                    grid_thws_for_rope.append(merged_thw.clone())
-                    is_history_list.append(False)
-            grid_thw_merged = grid_thw_merged_for_tokens
-        else:
-            grid_thw_merged = [
-                merged_thw.prod() // self.data_args.image_processor.merge_size**2 for merged_thw in grid_thw_merged
-            ]
-            grid_thws_for_rope = None
-            is_history_list = None
+        grid_thw_merged = [
+            merged_thw.prod() // self.data_args.image_processor.merge_size**2 for merged_thw in grid_thw_merged
+        ]
 
         data_dict = preprocess_qwen_2_visual(
             chat_sources,
@@ -1127,24 +1100,16 @@ class NavPixelGoalDataset(Dataset):
             grid_thw_image=grid_thw_merged if grid_thw_merged else None,
         )
 
-        # Use compressed grid_thw for RoPE if in compressor mode
-        rope_grid_thw = grid_thws_for_rope if grid_thws_for_rope is not None else grid_thws
         position_ids, _ = self.get_rope_index(
             self.data_args.image_processor.merge_size,
             data_dict["input_ids"],
-            image_grid_thw=torch.stack(rope_grid_thw, dim=0) if rope_grid_thw else None,
+            image_grid_thw=torch.stack(grid_thws, dim=0) if grid_thws else None,
         )
 
         data_dict["position_ids"] = position_ids
         data_dict["attention_mask"] = [data_dict["input_ids"][0].size(0)]
         data_dict["pixel_values"] = torch.cat(images, dim=0)
-        # image_grid_thw: original for ViT processing
         data_dict["image_grid_thw"] = torch.cat([thw.unsqueeze(0) for thw in grid_thws], dim=0)
-
-        if self.use_compressor:
-            # Compressor fields: always present in compressor mode
-            data_dict["is_history_image"] = torch.tensor(is_history_list, dtype=torch.bool)
-            data_dict["image_grid_thw_rope"] = torch.stack(grid_thws_for_rope, dim=0)
 
         if self.pixel_goal_only:
             goal_len = end_frame_id - start_frame_id - 1
@@ -1273,15 +1238,6 @@ class DataCollatorForSupervisedDataset(object):
         batch["pixel_values_videos"] = concat_videos
         batch["video_grid_thw"] = video_grid_thw
         batch["position_ids"] = position_ids
-
-        # Compressor fields
-        if "is_history_image" in instances[0]:
-            # Concatenate per-image boolean masks from all samples in batch
-            hist_masks = [instance["is_history_image"] for instance in instances if "is_history_image" in instance]
-            batch["is_history_image"] = torch.cat(hist_masks, dim=0)
-        if "image_grid_thw_rope" in instances[0]:
-            rope_thws = [instance["image_grid_thw_rope"] for instance in instances if "image_grid_thw_rope" in instance]
-            batch["image_grid_thw_rope"] = torch.cat(rope_thws, dim=0)
 
         if "traj_images" in instances[0]:
             traj_images, traj_depths, traj_poses = tuple(

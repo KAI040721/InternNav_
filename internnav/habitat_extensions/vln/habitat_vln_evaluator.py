@@ -70,6 +70,7 @@ class HabitatVLNEvaluator(DistributedEvaluator):
         self.epoch = args.epoch
         self.max_steps_per_episode = args.max_steps_per_episode
         self.output_path = args.output_path
+        self.num_episodes = getattr(args, "num_episodes", None)
 
         # create habitat config
         self.config_path = cfg.env.env_settings['config_path']
@@ -304,6 +305,10 @@ class HabitatVLNEvaluator(DistributedEvaluator):
         sucs, spls, oss, nes, ndtw = self.resume_from_output_path()
 
         # Episode loop is now driven by env.reset() + env.is_running
+        # Limit episodes if num_episodes is specified
+        if self.num_episodes is not None:
+            self.env.episodes = self.env.episodes[:self.num_episodes]
+
         process_bar = tqdm.tqdm(total=len(self.env.episodes), desc=f"Eval Epoch {self.epoch} Rank {self.rank}")
 
         while self.env.is_running:

@@ -25,6 +25,20 @@ import torch
 import transformers
 from torchvision.transforms import v2
 
+# Override default NCCL timeout to avoid timeouts during gradient accumulation
+# with variable-length sequences (default 600s is too short)
+from datetime import timedelta as _timedelta
+try:
+    import torch.distributed.constants as _dist_constants
+    _dist_constants.default_pg_nccl_timeout = _timedelta(seconds=7200)
+except Exception:
+    pass
+try:
+    from accelerate.utils.dataclasses import InitProcessGroupKwargs as _IPGK
+    _IPGK.__dataclass_fields__["timeout"].default = _timedelta(seconds=7200)
+except Exception:
+    pass
+
 project_root = Path(__file__).parent.parent.parent
 sys.path.append(str(project_root))
 
@@ -39,6 +53,7 @@ from transformers import (
 
 from internnav.dataset.internvla_n1_lerobot_dataset import make_supervised_data_module
 from internnav.model.basemodel.internvla_n1.internvla_n1 import InternVLAN1ForCausalLM
+from internnav.model.compressor_wrapper import apply_compressor_stage1a, apply_compressor_stage2, apply_compressor_stage3b, apply_compressor_stage3
 from internnav.trainer.internvla_n1_argument import (
     DataArguments,
     ModelArguments,
@@ -81,79 +96,147 @@ def smart_tokenizer_and_embedding_resize(
 
 def apply_lora_to_qwen3vl(model, model_args):
     """
-    对Qwen3VL模型应用Pure LoRA微调策略:
-    - 冻结所有基础参数，只训练 LoRA adapters
-    - tune_mm_vision=True 时 ViT 也加 LoRA (qkv, proj, fc1, fc2)
-    - Merger/Projector 通过 fc1, fc2 的 LoRA 间接微调
-    - Norms: 全部冻结
-    - 可训练参数: ~39.7M (1.83%)
+    对Qwen3VL模型应用针对VLN任务优化的微调策略 (v4):
+    
+    设计原则:
+      VLN任务需要模型在室内3D扫描场景中理解空间布局、物体语义和方向关系。
+      预训练ViT在自然图片上训练，与室内全景场景存在域差距，
+      但ViT的底层特征(边缘、纹理)仍然通用，因此用LoRA轻量适配。
+      Merger/Deepstack是视觉→语言的桥梁，对任务高度敏感，需全参微调。
+      LLM需要学习导航决策的推理模式，用LoRA高效适配。
+      Embedding层需解冻以适应导航特有的token分布（坐标、动作词等）。
+    
+    微调策略:
+      ┌─────────────────────────┬──────────────────────┐
+      │ 模块                    │ 微调方式             │
+      ├─────────────────────────┼──────────────────────┤
+      │ ViT patch_embed (Conv3d)│ 冻结                 │
+      │ ViT pos_embed           │ 冻结                 │
+      │ ViT blocks (attn)       │ LoRA                 │
+      │ ViT blocks (mlp)        │ 冻结                 │
+      │ ViT norms               │ 全参微调             │
+      │ Merger (primary)        │ 全参微调             │
+      │ Deepstack Mergers (x3)  │ 全参微调             │
+      │ LLM embed_tokens        │ 全参微调             │
+      │ LLM layers (attn+mlp)   │ LoRA                 │
+      │ LLM norms (RMSNorm)     │ 全参微调             │
+      │ lm_head                 │ 全参微调(与embed共享) │
+      └─────────────────────────┴──────────────────────┘
     """
-    # 先冻结所有参数
+    # Step 1: 冻结所有参数
     for param in model.parameters():
         param.requires_grad = False
     
-    # 从参数获取target_modules配置
-    lora_target_modules_str = getattr(model_args, 'lora_target_modules', 
-        "q_proj,k_proj,v_proj,o_proj,gate_proj,up_proj,down_proj")
-    
-    # 解析target_modules
-    if lora_target_modules_str == "all-linear":
-        # all-linear: 只包含LLM的线性层
-        target_modules = [
-            "q_proj", "k_proj", "v_proj", "o_proj",
-            "gate_proj", "up_proj", "down_proj"
-        ]
-    else:
-        target_modules = [m.strip() for m in lora_target_modules_str.split(",")]
-    
-    # 如果需要训练视觉塔，添加视觉层模块（含 fc1, fc2 用于覆盖 Merger）
+    # Step 2: 构建 LoRA target modules
+    # LLM 线性层
+    llm_modules = ["q_proj", "k_proj", "v_proj", "o_proj",
+                   "gate_proj", "up_proj", "down_proj"]
+    # ViT attention 线性层 (tune_mm_vision=True 时)
+    vision_modules = []
     if getattr(model_args, 'tune_mm_vision', False):
-        vision_modules = ["qkv", "proj", "fc1", "fc2"]
-        target_modules = list(set(target_modules + vision_modules))
+        vision_modules = ["qkv", "proj"]  # ViT attention
+        # 注意: 不加 linear_fc1/linear_fc2 避免匹配到 merger
+        # ViT MLP 保持冻结，保留通用视觉特征
     
-    # 获取bias配置
+    target_modules = list(set(llm_modules + vision_modules))
+    
     lora_bias = getattr(model_args, 'lora_bias', 'none')
+    
+    # Step 3: modules_to_save = 全参微调的模块
+    # "merger" 同时匹配 visual.merger 和 visual.deepstack_merger_list 中的 merger
+    # "embed_tokens" 和 "lm_head" 解冻 embedding 和输出头
+    modules_to_save = ["merger", "embed_tokens", "lm_head"]
     
     lora_config = LoraConfig(
         r=model_args.lora_r,
         lora_alpha=model_args.lora_alpha,
         target_modules=target_modules,
+        modules_to_save=modules_to_save,
         lora_dropout=model_args.lora_dropout,
         bias=lora_bias,
         task_type=TaskType.CAUSAL_LM,
     )
     
-    # 应用LoRA（纯 LoRA，不解冻任何基础参数）
+    # Step 4: 应用 LoRA
     model = get_peft_model(model, lora_config)
     
-    # 打印可训练参数信息
+    # Step 5: 解冻 Deepstack Mergers (全参微调)
+    # PEFT modules_to_save 的 "merger" 只匹配了 visual.merger，
+    # deepstack_merger_list 中的子模块需要手动解冻
+    for name, param in model.named_parameters():
+        if "deepstack_merger_list" in name:
+            param.requires_grad = True
+    
+    # Step 6: 解冻所有 norm 层 (ViT LayerNorm + LLM RMSNorm)
+    for name, param in model.named_parameters():
+        if "norm" in name.lower() or "layernorm" in name.lower():
+            param.requires_grad = True
+    
+    # Step 7: 打印可训练参数信息
     model.print_trainable_parameters()
     
-    # 打印详细的参数训练状态
+    # Step 8: 详细日志
     if torch.distributed.get_rank() == 0:
         print("")
         print("=" * 80)
-        print("LoRA Configuration Summary (Pure LoRA):")
+        print("VLN-Optimized LoRA Configuration (v4):")
         print("=" * 80)
         print(f"LoRA Rank: {model_args.lora_r}")
         print(f"LoRA Alpha: {model_args.lora_alpha}")
         print(f"LoRA Dropout: {model_args.lora_dropout}")
         print(f"LoRA Bias: {lora_bias}")
-        print(f"Target Modules: {target_modules}")
+        print(f"LoRA Target Modules: {target_modules}")
+        print(f"Full Fine-tune Modules (modules_to_save): {modules_to_save}")
         print("")
-        print("Training Status:")
-        print(f"  - Vision Tower LoRA: {'Enabled' if getattr(model_args, 'tune_mm_vision', False) else 'FROZEN'}")
-        print("  - LLM Attention: LoRA (q/k/v/o_proj)")
-        print("  - LLM MLP: LoRA (gate/up/down_proj)")
-        print("  - All Norms: FROZEN (LoRA only)")
-        print("  - Merger/Projector: LoRA (fc1, fc2)")
+        print("Training Status by Component:")
+        print("  [Vision Tower]")
+        print(f"    - patch_embed (Conv3d):     FROZEN")
+        print(f"    - pos_embed (Embedding):    FROZEN")
+        print(f"    - blocks.attn (qkv+proj):   LoRA r={model_args.lora_r}")
+        print(f"    - blocks.mlp (fc1+fc2):     FROZEN")
+        print(f"    - blocks.norm (LayerNorm):  FULL fine-tune")
+        print("  [Visual Projector]")
+        print(f"    - merger (primary):         FULL fine-tune")
+        print(f"    - deepstack_mergers (x3):   FULL fine-tune")
+        print("  [Language Model]")
+        print(f"    - embed_tokens:             FULL fine-tune")
+        print(f"    - layers.attn (q/k/v/o):    LoRA r={model_args.lora_r}")
+        print(f"    - layers.mlp (gate/up/down): LoRA r={model_args.lora_r}")
+        print(f"    - layers.norm (RMSNorm):    FULL fine-tune")
+        print(f"    - lm_head:                  FULL fine-tune (tied with embed_tokens)")
         print("=" * 80)
+        
+        # 按模块统计可训练参数
+        stats = {}
+        for n, p in model.named_parameters():
+            if not p.requires_grad:
+                continue
+            if "visual" in n and "merger" not in n and "deepstack" not in n:
+                cat = "ViT (LoRA + Norms)"
+            elif "merger" in n or "deepstack" in n:
+                cat = "Merger + Deepstack (Full)"
+            elif "embed_tokens" in n:
+                cat = "Embed Tokens (Full)"
+            elif "lm_head" in n:
+                cat = "LM Head (Full)"
+            elif "lora" in n.lower():
+                cat = "LLM LoRA adapters"
+            elif "norm" in n.lower():
+                cat = "LLM Norms (Full)"
+            else:
+                cat = "Other"
+            stats[cat] = stats.get(cat, 0) + p.numel()
+        
+        print("")
+        print("Trainable Parameters by Component:")
+        total_trainable = sum(stats.values())
+        for cat, count in sorted(stats.items(), key=lambda x: -x[1]):
+            print(f"  {cat}: {count/1e6:.2f}M ({count/total_trainable*100:.1f}%)")
+        print(f"  ─────────────────────────────────")
+        print(f"  Total Trainable: {total_trainable/1e6:.2f}M")
         print("")
     
     return model
-
-
-
 
 def set_model(model_args, model):
     if model_args.tune_mm_vision:
@@ -287,10 +370,51 @@ def train(attn_implementation="flash_attention_2"):
     if data_args.model_type == "internvla-n1":
         model.get_model().initialize_vision_modules(model_args=model_args)
     
+    # Compressor模式
+    use_compressor = getattr(model_args, 'use_compressor', False)
+    
     # 应用LoRA或全参微调
-    if use_lora and data_args.model_type == "qwen3vl":
+    if use_compressor and data_args.model_type == "qwen3vl":
         print("=" * 50)
-        print("Using Pure LoRA - All base layers frozen, only LoRA adapters trained")
+        print(f"Using Compressor Stage {model_args.compressor_stage}")
+        print("=" * 50)
+        compressor_config = {
+            'd_model': getattr(model.config, 'hidden_size', model.config.text_config.hidden_size),
+            'd_bottleneck': model_args.compressor_d_bottleneck,
+            'n_queries': model_args.compressor_n_queries,
+            'n_heads': model_args.compressor_n_heads,
+            'n_layers': model_args.compressor_n_layers,
+        }
+        if model_args.compressor_stage == "3":
+            model = apply_compressor_stage3(
+                model, compressor_config,
+                stage3b_checkpoint=model_args.compressor_stage1a_checkpoint,
+                lora_r=model_args.lora_r,
+                lora_alpha=model_args.lora_alpha,
+                lora_dropout=model_args.lora_dropout,
+                tune_mm_vision=getattr(model_args, 'tune_mm_vision', True),
+            )
+        elif model_args.compressor_stage == "3b":
+            model = apply_compressor_stage3b(
+                model, compressor_config,
+                stage1a_checkpoint=model_args.compressor_stage1a_checkpoint,
+                lora_r=model_args.lora_r,
+                lora_alpha=model_args.lora_alpha,
+                lora_dropout=model_args.lora_dropout,
+            )
+        elif model_args.compressor_stage == "2":
+            model = apply_compressor_stage2(
+                model, compressor_config,
+                stage1a_checkpoint=model_args.compressor_stage1a_checkpoint,
+            )
+        else:
+            model = apply_compressor_stage1a(model, compressor_config)
+        # Pass compressor settings to data_args
+        data_args.use_compressor = True
+        data_args.compressor_n_queries = model_args.compressor_n_queries
+    elif use_lora and data_args.model_type == "qwen3vl":
+        print("=" * 50)
+        print("Using LoRA for attention layers, full fine-tuning for MLP/Merger/Norms")
         print("=" * 50)
         model = apply_lora_to_qwen3vl(model, model_args)
     else:
@@ -332,6 +456,27 @@ def train(attn_implementation="flash_attention_2"):
     model.config.use_cache = True
 
     safe_save_model_for_hf_trainer(trainer=trainer, output_dir=training_args.output_dir)
+
+    # Save compressor weights separately (PEFT save_pretrained does NOT include them)
+    if getattr(model_args, 'use_compressor', False):
+        import torch.distributed as dist
+        if not dist.is_initialized() or dist.get_rank() == 0:
+            base_model = trainer.model
+            # Navigate through DeepSpeed / PEFT wrappers
+            if hasattr(base_model, 'module'):
+                base_model = base_model.module
+            if hasattr(base_model, 'base_model') and hasattr(base_model.base_model, 'model'):
+                # PEFT wrapper: model.base_model.model is the original model
+                base_model = base_model.base_model.model
+            if hasattr(base_model, 'compressor'):
+                from safetensors.torch import save_file
+                comp_state = {k: v.cpu() for k, v in base_model.compressor.state_dict().items()}
+                stage = getattr(model_args, 'compressor_stage', 'unknown')
+                save_path = os.path.join(training_args.output_dir, f'compressor_stage{stage}.safetensors')
+                save_file(comp_state, save_path)
+                print(f"[Compressor] Saved {len(comp_state)} tensors to {save_path}")
+            else:
+                print("[Compressor] WARNING: model has no compressor attribute, skipping save")
 
 
 if __name__ == "__main__":
