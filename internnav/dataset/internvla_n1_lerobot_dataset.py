@@ -1138,14 +1138,19 @@ class NavPixelGoalDataset(Dataset):
         data_dict["pixel_values"] = torch.cat(images, dim=0)
         data_dict["image_grid_thw"] = torch.cat([thw.unsqueeze(0) for thw in grid_thws], dim=0)
 
-        # Compressor 额外字段
-        if self.use_compressor and num_history_images > 0:
-            # is_history_image: 布尔掩码，标记哪些图像是历史帧
+        # Compressor 额外字段: 始终生成（即使 num_history_images==0），保证 batch 中所有样本结构一致
+        if self.use_compressor:
             n_total = len(grid_thws)
             is_history = torch.zeros(n_total, dtype=torch.bool)
-            is_history[:num_history_images] = True
+            if num_history_images > 0:
+                is_history[:num_history_images] = True
             data_dict["is_history_image"] = is_history
-            data_dict["image_grid_thw_rope"] = torch.stack(grid_thws_for_rope, dim=0)
+            # image_grid_thw_rope: 用于 RoPE 的 grid_thw
+            if grid_thws_for_rope is not None:
+                data_dict["image_grid_thw_rope"] = torch.stack(grid_thws_for_rope, dim=0)
+            else:
+                # 无历史帧时使用原始 grid_thw
+                data_dict["image_grid_thw_rope"] = torch.cat([thw.unsqueeze(0) for thw in grid_thws], dim=0)
 
         if self.pixel_goal_only:
             goal_len = end_frame_id - start_frame_id - 1
@@ -1276,11 +1281,10 @@ class DataCollatorForSupervisedDataset(object):
         batch["position_ids"] = position_ids
 
         # Compressor 字段: is_history_image 和 image_grid_thw_rope
-        if "is_history_image" in instances[0]:
-            # 拼接所有batch样本的 is_history_image
+        if any("is_history_image" in inst for inst in instances):
             is_hist_list = [inst["is_history_image"] for inst in instances if "is_history_image" in inst]
             batch["is_history_image"] = torch.cat(is_hist_list, dim=0)
-        if "image_grid_thw_rope" in instances[0]:
+        if any("image_grid_thw_rope" in inst for inst in instances):
             rope_thws = [inst["image_grid_thw_rope"] for inst in instances if "image_grid_thw_rope" in inst]
             batch["image_grid_thw_rope"] = torch.cat(rope_thws, dim=0)
 

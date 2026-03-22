@@ -139,6 +139,7 @@ torchrun --nnodes=1 --nproc_per_node=${NUM_GPUS} \
     --seed 42 \
     --data_seed 42 \
     --run_name ${run_name} \
+    --remove_unused_columns False \
     --report_to wandb
 
 echo ""
