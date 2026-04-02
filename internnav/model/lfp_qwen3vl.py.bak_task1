@@ -84,15 +84,13 @@ def get_mlp(in_dim, hidden_dim, out_dim, zero_init=False):
 # ============================================================
 
 class TokenRouter(nn.Module):
-    """Simple linear router: hidden_size -> 2 (KEEP vs DROP).
-    
-    Uses default Kaiming initialization (same as CogVLA final version).
-    """
+    """Simple linear router: hidden_size -> 2 (KEEP vs DROP)."""
 
     def __init__(self, hidden_size):
         super().__init__()
         self.router = nn.Linear(hidden_size, 2)
-        # Default Kaiming init — CogVLA also uses default init (zero_init commented out)
+        nn.init.zeros_(self.router.weight)
+        nn.init.zeros_(self.router.bias)
 
     def forward(self, x, visual_pos_mask=None):
         # [bs, seq_len, dim] -> [bs, seq_len, 2]
@@ -105,19 +103,19 @@ class FiLMedTokenRouter(nn.Module):
     before routing. Same design as CogVLA's FiLMedTokenRouter, adapted for
     arbitrary visual token positions (via visual_pos_mask).
 
-    Initialization (aligned with CogVLA):
-      - router linear: default Kaiming init (CogVLA also uses default)
-      - scale/shift MLPs: default Kaiming init (NOT zero_init!)
-        zero_init=True would cause GELU(0*x+0)=0 → dead gradient zone
-        where all MLP weights permanently get zero gradients.
+    Key difference from CogVLA: scale/shift MLPs and router linear are
+    zero-initialized so FiLM starts as identity (gamma=0, beta=0 => filmed = x)
+    and router starts at 50/50 KEEP/DROP. This prevents gradient explosion from
+    176M randomly-initialized params dominating the gradient norm.
     """
 
     def __init__(self, hidden_size):
         super().__init__()
         self.router = nn.Linear(hidden_size, 2)
-        # Default Kaiming init for router (CogVLA also uses default)
-        self.scale = get_mlp(hidden_size, hidden_size // 2, hidden_size, zero_init=False)
-        self.shift = get_mlp(hidden_size, hidden_size // 2, hidden_size, zero_init=False)
+        nn.init.zeros_(self.router.weight)
+        nn.init.zeros_(self.router.bias)
+        self.scale = get_mlp(hidden_size, hidden_size // 2, hidden_size, zero_init=True)
+        self.shift = get_mlp(hidden_size, hidden_size // 2, hidden_size, zero_init=True)
 
     def forward(self, x, visual_pos_mask):
         """
@@ -168,6 +166,10 @@ class Qwen3VLDecoderLFPLayer(Qwen3VLTextDecoderLayer):
         super().__init__(config, layer_idx)
         self.router_factor = ratio
         self._lfp_enable_film = enable_film
+        # 默认 False；attach_lfp 会给最后一层设为 True
+        # 最后一层 router 无法从 loss 获得梯度（LM head 只读文本位置），
+        # 改用文本-视觉点积相似度来决定保留哪些 visual token。
+        self.is_last_lfp_layer = False
 
         hidden_size = config.hidden_size
         if enable_film:
@@ -261,8 +263,22 @@ class Qwen3VLDecoderLFPLayer(Qwen3VLTextDecoderLayer):
 
         # ---- Router ----
         normed_hidden = self.input_layernorm(hidden_states)
-        router_logits_raw = self.router(normed_hidden, visual_pos_mask)
-        router_weights_all = F.softmax(router_logits_raw, dim=-1)[:, :, 1]  # P(KEEP)
+
+        if self.is_last_lfp_layer:
+            # 最后一层的 router 无法从 VLN loss 获得梯度（LM head 只读文本位置，
+            # visual token MLP 输出对 loss 没有贡献）。
+            # 改用文本-视觉点积相似度打分：
+            #   score(v) = <norm(visual_v), mean_norm(text_tokens)>
+            text_mask = ~visual_pos_mask
+            text_sum = (normed_hidden * text_mask.unsqueeze(-1).to(normed_hidden.dtype)).sum(dim=1)
+            text_count = text_mask.sum(dim=1, keepdim=True).to(normed_hidden.dtype).clamp(min=1.0)
+            text_mean = text_sum / text_count
+            # 点积相似度 → sigmoid 归一化到 [0,1] 作为 router weight
+            sim_scores = (normed_hidden * text_mean.unsqueeze(1)).sum(dim=-1)
+            router_weights_all = torch.sigmoid(sim_scores)
+        else:
+            router_logits_raw = self.router(normed_hidden, visual_pos_mask)
+            router_weights_all = F.softmax(router_logits_raw, dim=-1)[:, :, 1]  # P(KEEP)
 
         # Non-visual tokens always get router_weight=1.0 (MLP output not scaled)
         router_weights_all = torch.where(visual_pos_mask, router_weights_all,
@@ -453,10 +469,7 @@ def attach_lfp(model, lfp_config=None):
             ratios = [max(r, min_ratio) for r in ratios]
             lfp_target_layers = [
                 i for i in range(num_layers)
-                if ratios[i] <= max_ratio and i < num_layers - 1
-                # Exclude last layer: visual outputs from last decoder layer
-                # have no subsequent layer to backprop text gradients through,
-                # so router gradient is always zero (architecture-level dead zone).
+                if ratios[i] <= max_ratio and i < num_layers - 1  # 排除最后一层（梯度断路）
             ]
         elif lfp_type == "deep_all":
             lfp_target_layers = list(range(2, num_layers))
@@ -492,6 +505,14 @@ def attach_lfp(model, lfp_config=None):
         object.__setattr__(new_layer, '_text_model_ref', text_model)
 
         text_model.layers[layer_idx] = new_layer
+
+    # ---- 标记最后一层：仅在自动选层时启用文本-视觉相似度路由 ----
+    # 如果显式提供了 target_layers_override（例如从 checkpoint 解析得来），
+    # 则保持与训练时结构完全一致，不改写最后一层路由行为。
+    if target_layers_override is None:
+        last_lfp_layer_idx = lfp_target_layers[-1]
+        text_model.layers[last_lfp_layer_idx].is_last_lfp_layer = True
+        print(f"  → Layer {last_lfp_layer_idx} marked as last LFP layer (text-visual similarity routing)")
 
     # ---- Monkey-patch TextModel forward to store visual_pos_mask ----
     original_text_forward = text_model.__class__.forward

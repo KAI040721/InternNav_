@@ -258,32 +258,15 @@ class HabitatVLNEvaluator(DistributedEvaluator):
                 if use_lfp:
                     from safetensors.torch import load_file as safe_load_file
                     from internnav.model.lfp_qwen3vl import attach_lfp
-
-                    lfp_ckpt_path = self.model_args.lfp_checkpoint
-                    lfp_state = safe_load_file(lfp_ckpt_path)
-
-                    # 从 checkpoint 自动推断 router 覆盖的 decoder 层，保证评估结构与训练完全一致。
-                    lfp_layer_pattern = re.compile(r"^model\.language_model\.layers\.(\d+)\.router\.")
-                    lfp_layers_from_ckpt = sorted(
-                        {
-                            int(m.group(1))
-                            for k in lfp_state.keys()
-                            for m in [lfp_layer_pattern.match(k)]
-                            if m is not None
-                        }
-                    )
-
                     lfp_config = {
                         'lfp_type': getattr(self.model_args, 'lfp_type', 'shiftedcos_decay_0.85_0.15'),
                         'lfp_average_factor': getattr(self.model_args, 'lfp_average_factor', 0.5),
                         'lfp_enable_film': getattr(self.model_args, 'lfp_enable_film', True),
                     }
-                    if lfp_layers_from_ckpt:
-                        lfp_config['lfp_target_layers_override'] = lfp_layers_from_ckpt
-                        print(f"[LFP] Using checkpoint-defined target layers: {lfp_layers_from_ckpt}")
-
                     model = attach_lfp(model, lfp_config)
 
+                    lfp_ckpt_path = self.model_args.lfp_checkpoint
+                    lfp_state = safe_load_file(lfp_ckpt_path)
                     # 将保存的 router 权重加载到模型对应参数中
                     model_params = dict(model.named_parameters())
                     loaded_count = 0
@@ -971,10 +954,10 @@ class HabitatVLNEvaluator(DistributedEvaluator):
                             is_hist[:n_hist] = True
 
                         # 构造 image_grid_thw_rope: 压缩后的历史帧用 [1, sq, sq]
-                        # 必须用 pre-merge 维度: get_rope_index 内部 visual_pos = t*(h//m)*(w//m)
-                        # 要使 1*(sq//2)*(sq//2) = n_queries → sq = sqrt(n_queries) * merge_size
-                        # e.g. n_queries=64, merge_size=2 → sq=16, visual_pos=1*8*8=64 ✓
-                        sq = int(math.sqrt(self.compressor_n_queries)) * 2  # pre-merge dim, merge_size=2
+                        # 与训练时 dataset 保持一致: sq = sqrt(n_queries) = 4
+                        # get_rope_index 内部会做 h//merge_size → 4//2=2, 生成 2×2=4 个 visual pos
+                        # 剩余 12 个 image_pad 按文本 token 方式编号 (训练时也是如此)
+                        sq = int(math.sqrt(self.compressor_n_queries))  # 16 -> 4
                         grid_thw_rope = inputs["image_grid_thw"].clone()
                         for i in range(n_images):
                             if is_hist[i]:

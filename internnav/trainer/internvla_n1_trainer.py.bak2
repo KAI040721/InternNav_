@@ -54,87 +54,6 @@ from internnav.model.compressor_wrapper_film_vit import attach_compressor_film_v
 from internnav.model.lfp_qwen3vl import attach_lfp
 
 
-class SeparateGradClipTrainer(Trainer):
-    """
-    HuggingFace Trainer with separate gradient clipping for new modules.
-
-    Uses monkey-patching of accelerator.clip_grad_norm_ to split parameters
-    into base (LoRA, frozen) and new (compressor + LFP router) groups,
-    applying different max_grad_norm values to each.
-
-    Works with DeepSpeed ZeRO-2 because after all_reduce, each GPU has
-    the full gradient (not partitioned like ZeRO-3).
-    """
-
-    def __init__(self, *args, new_module_max_grad_norm=None, **kwargs):
-        super().__init__(*args, **kwargs)
-        self._new_module_max_grad_norm = new_module_max_grad_norm
-
-        if new_module_max_grad_norm is not None and new_module_max_grad_norm > 0:
-            self._setup_separate_grad_clip()
-
-    def _setup_separate_grad_clip(self):
-        """Monkey-patch accelerator.clip_grad_norm_ to split into groups."""
-        trainer_ref = self
-        original_clip = self.accelerator.clip_grad_norm_
-
-        def _separate_clip(parameters, max_norm, norm_type=2):
-            # Unwrap model to get parameter names
-            model = trainer_ref.model
-            if hasattr(model, 'module'):
-                model = model.module
-
-            # Build set of new module parameter IDs
-            new_param_ids = set()
-            for name, param in model.named_parameters():
-                if "compressor" in name or ".router." in name:
-                    new_param_ids.add(id(param))
-
-            # Split parameters into groups
-            base_params = []
-            new_params = []
-            for p in parameters:
-                if not p.requires_grad or p.grad is None:
-                    continue
-                if id(p) in new_param_ids:
-                    new_params.append(p)
-                else:
-                    base_params.append(p)
-
-            # Clip each group independently
-            base_norm = (
-                torch.nn.utils.clip_grad_norm_(base_params, max_norm, norm_type=norm_type)
-                if base_params else torch.tensor(0.0)
-            )
-            new_norm = (
-                torch.nn.utils.clip_grad_norm_(
-                    new_params, trainer_ref._new_module_max_grad_norm, norm_type=norm_type
-                )
-                if new_params else torch.tensor(0.0)
-            )
-
-            # Log separate norms (visible in training logs via wandb/tensorboard)
-            if trainer_ref.state.global_step % trainer_ref.args.logging_steps == 0:
-                if hasattr(trainer_ref, '_wandb_log_queue'):
-                    pass  # wandb logging handled separately
-                # Store for custom logging
-                trainer_ref._last_base_grad_norm = float(base_norm)
-                trainer_ref._last_new_grad_norm = float(new_norm)
-
-            # Return combined norm (for HF logging)
-            return (base_norm ** 2 + new_norm ** 2) ** 0.5
-
-        self.accelerator.clip_grad_norm_ = _separate_clip
-
-    def log(self, logs, start_time=None):
-        """Override log to include separate gradient norms."""
-        if hasattr(self, '_last_base_grad_norm'):
-            logs['grad_norm_base'] = self._last_base_grad_norm
-        if hasattr(self, '_last_new_grad_norm'):
-            logs['grad_norm_new_modules'] = self._last_new_grad_norm
-        super().log(logs, start_time=start_time)
-
-
 def safe_save_model_for_hf_trainer(trainer: transformers.Trainer, output_dir: str):
     """Collects the state dict and dump to disk."""
 
@@ -478,13 +397,7 @@ def train(attn_implementation="flash_attention_2"):
         data_module = make_supervised_data_module_packed(tokenizer=tokenizer, data_args=data_args)  # noqa: F821
     else:
         data_module = make_supervised_data_module(tokenizer=tokenizer, data_args=data_args)
-    new_module_max_grad_norm = getattr(training_args, 'new_module_max_grad_norm', None)
-    trainer = SeparateGradClipTrainer(
-        model=model, processing_class=tokenizer, args=training_args,
-        new_module_max_grad_norm=new_module_max_grad_norm,
-        **data_module,
-    )
-
+    trainer = Trainer(model=model, processing_class=tokenizer, args=training_args, **data_module)
     from tabulate import tabulate
 
     if trainer.is_world_process_zero():

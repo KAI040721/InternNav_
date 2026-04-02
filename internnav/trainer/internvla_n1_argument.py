@@ -80,3 +80,9 @@ class TrainingArguments(transformers.TrainingArguments):
     )
     mm_projector_lr: Optional[float] = None
     vision_tower_lr: Optional[float] = None
+    new_module_max_grad_norm: Optional[float] = field(
+        default=None,
+        metadata={"help": "Separate max_grad_norm for new modules (compressor + LFP router). "
+                          "If set, base parameters use max_grad_norm and new modules use this value. "
+                          "If None, all parameters use max_grad_norm."},
+    )

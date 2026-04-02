@@ -155,18 +155,10 @@ def make_patched_vit_forward(original_vit_forward, compressor, outer_model_ref):
             new_seqlens = []
             cos_emb, sin_emb = position_embeddings
 
-            # Pre-allocate shared aggr token RoPE embeddings (identity rotary = cos=1, sin=0)
+            # Prepare aggr tokens (shared across history images)
             aggr = compressor.aggr_tokens[0].to(
                 device=hidden_states.device, dtype=hidden_states.dtype
             )  # [n_aggr, vit_dim]
-            aggr_cos_shared = torch.ones(
-                n_aggr, cos_emb.shape[-1],
-                device=cos_emb.device, dtype=cos_emb.dtype
-            )
-            aggr_sin_shared = torch.zeros(
-                n_aggr, sin_emb.shape[-1],
-                device=sin_emb.device, dtype=sin_emb.dtype
-            )
             is_hist_list = is_history_image.tolist() if torch.is_tensor(is_history_image) else list(is_history_image)
 
             offset = 0
@@ -180,9 +172,17 @@ def make_patched_vit_forward(original_vit_forward, compressor, outer_model_ref):
                     new_parts.append(img_tokens)
                     new_parts.append(aggr)
                     new_cos_parts.append(img_cos)
-                    new_cos_parts.append(aggr_cos_shared)
                     new_sin_parts.append(img_sin)
-                    new_sin_parts.append(aggr_sin_shared)
+                    # Aggr tokens use per-image average RoPE (Option C):
+                    # average the raw rotary angles of all patch tokens in this image,
+                    # then compute cos/sin. This gives aggr tokens a "center of image"
+                    # position, enabling meaningful relative-position attention with patches.
+                    # Note: cos_emb/sin_emb are cos(θ)/sin(θ) of the raw angles,
+                    # and mean(cos(θ_i)) ≈ cos(mean(θ_i)) for nearby angles.
+                    aggr_cos_img = img_cos.mean(dim=0, keepdim=True).expand(n_aggr, -1)
+                    aggr_sin_img = img_sin.mean(dim=0, keepdim=True).expand(n_aggr, -1)
+                    new_cos_parts.append(aggr_cos_img)
+                    new_sin_parts.append(aggr_sin_img)
                     new_seqlens.append(n_tokens + n_aggr)
                 else:
                     new_parts.append(img_tokens)
@@ -209,6 +209,23 @@ def make_patched_vit_forward(original_vit_forward, compressor, outer_model_ref):
         aggr_deepstack_features = []  # aggr token features at deepstack layers
         film_idx = 0
 
+        # Build boolean mask for history tokens (including aggr tokens).
+        # FiLM should ONLY modulate history image tokens, not current frame tokens.
+        # CogVLA processes one image at a time so this isn't an issue there,
+        # but our packed ViT forward has history + current in the same sequence.
+        if has_history:
+            _hist_mask_parts = []
+            _offset = 0
+            for _img_idx in range(n_images):
+                _n_tok = tokens_per_image[_img_idx]
+                if is_hist_list[_img_idx]:
+                    # History image patches + aggr tokens: apply FiLM
+                    _hist_mask_parts.append(torch.ones(_n_tok + n_aggr, dtype=torch.bool, device=hidden_states.device))
+                else:
+                    # Current image patches: do NOT apply FiLM
+                    _hist_mask_parts.append(torch.zeros(_n_tok, dtype=torch.bool, device=hidden_states.device))
+            history_token_mask = torch.cat(_hist_mask_parts)  # [total_seq_len]
+
         for layer_num, blk in enumerate(self_vit.blocks):
             hidden_states = blk(
                 hidden_states,
@@ -217,10 +234,16 @@ def make_patched_vit_forward(original_vit_forward, compressor, outer_model_ref):
                 **kwargs,
             )
 
-            # Apply FiLM after the block (between blocks)
+            # Apply FiLM after the block (between blocks), ONLY to history tokens
             if has_history and layer_num >= film_start_block:
                 film_layer = compressor.get_film_layer(film_idx)
-                hidden_states = film_layer(hidden_states, instr_emb_single)
+                # FiLM: x_hist = x_hist * (1 + gamma) + beta, x_curr unchanged
+                filmed_all = film_layer(hidden_states, instr_emb_single)
+                hidden_states = torch.where(
+                    history_token_mask.unsqueeze(-1),  # [seq, 1]
+                    filmed_all,
+                    hidden_states,
+                )
                 film_idx += 1
 
             # DeepStack: extract intermediate features
