@@ -1018,34 +1018,46 @@ class NavPixelGoalDataset(Dataset):
         traj_images = []
         traj_depths = []  # optional
 
-        for id in range(0, end_frame_id):
+        # Only load frames we actually need: history + current (+ future only if pixel_goal_only)
+        needed_ids = sorted(set(history_id) | {start_frame_id})
+        for id in needed_ids:
             image_file = os.path.join(
                 video, f"observation.images.rgb.{height}cm_{pitch_1}deg", f"episode_{ep_id:06d}_{id}.jpg"
             )
             image = Image.open(image_file).convert('RGB')
-            lookdown_image = Image.open(image_file.replace(f'_{pitch_1}deg', f'_{pitch_2}deg')).convert('RGB')
+            if self.data_args.transform_train is not None:
+                image = self.data_args.transform_train(image)
+            image, grid_thw = self.process_image_unified(image)
+            images.append(image)
+            grid_thws.append(grid_thw)
+            if id == start_frame_id and pose is not None:
+                lookdown_file = image_file.replace(f'_{pitch_1}deg', f'_{pitch_2}deg')
+                lookdown_image = Image.open(lookdown_file).convert('RGB')
+                image_ld, grid_thw_ld = self.process_image_unified(lookdown_image)
+                images.append(image_ld)
+                grid_thws.append(grid_thw_ld)
+                depth_file = lookdown_file.replace('rgb', 'depth').replace('.jpg', '.png')
+                depth_image = Image.open(depth_file)
+                depth_image, resize_shape = self.preprocess_depth_image_v2(
+                    depth_image, do_depth_scale=True, depth_scale=1000, target_height=224, target_width=224
+                )
+                depth_image = torch.as_tensor(np.ascontiguousarray(depth_image)).float()
+                traj_images.append(lookdown_image)
+                traj_depths.append(depth_image)
 
-            depth_image = Image.open(
-                image_file.replace(f'_{pitch_1}deg', f'_{pitch_2}deg').replace('rgb', 'depth').replace('.jpg', '.png')
-            )
-
-            depth_image, resize_shape = self.preprocess_depth_image_v2(
-                depth_image, do_depth_scale=True, depth_scale=1000, target_height=224, target_width=224
-            )
-            depth_image = torch.as_tensor(np.ascontiguousarray(depth_image)).float()  # [H, W]
-            if id in history_id or id == start_frame_id:
-                if self.data_args.transform_train is not None:
-                    image = self.data_args.transform_train(image)
-                image, grid_thw = self.process_image_unified(image)
-                images.append(image)
-                grid_thws.append(grid_thw)
-                if id == start_frame_id and pose is not None:
-                    image, grid_thw = self.process_image_unified(lookdown_image)
-                    images.append(image)
-                    grid_thws.append(grid_thw)
-                    traj_images.append(lookdown_image)
-                    traj_depths.append(depth_image)
-            elif id > start_frame_id:
+        # Load future trajectory frames only when pixel_goal_only is enabled
+        if self.pixel_goal_only:
+            for id in range(start_frame_id + 1, end_frame_id):
+                image_file = os.path.join(
+                    video, f"observation.images.rgb.{height}cm_{pitch_2}deg", f"episode_{ep_id:06d}_{id}.jpg"
+                )
+                lookdown_image = Image.open(image_file).convert('RGB')
+                depth_file = image_file.replace('rgb', 'depth').replace('.jpg', '.png')
+                depth_image = Image.open(depth_file)
+                depth_image, resize_shape = self.preprocess_depth_image_v2(
+                    depth_image, do_depth_scale=True, depth_scale=1000, target_height=224, target_width=224
+                )
+                depth_image = torch.as_tensor(np.ascontiguousarray(depth_image)).float()
                 traj_images.append(lookdown_image)
                 traj_depths.append(depth_image)
 

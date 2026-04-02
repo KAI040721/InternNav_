@@ -1,23 +1,27 @@
 #!/bin/bash
 
 # ============================================
-# FiLM Compressor 联合训练脚本 - Qwen3-VL-2B
-# 
-# 目的: 在 baseline AllLoRA 基础上，添加 FiLM Compressor 模块
-#       历史帧走 FiLM 压缩 (primary + deepstack 都走 FiLM)
-#       一阶段联合训练: LoRA + Compressor 同时微调
-# 
+# CogVLA-aligned FiLM ViT Compressor + LFP 联合训练 - Qwen3-VL-2B
+#
+# 架构 (CogVLA-inspired):
+#   - FiLM conditioning: 所有 24 层 ViT block, 独立参数 (不共享)
+#   - Aggregation Tokens: 16 learnable tokens, ViT 内 self-attention 压缩
+#   - LFP (Latent Future Prediction): LLM decoder 层内 visual token routing
+#     shiftedcos decay, 平均保留 50% visual tokens
+#   - 历史帧: ViT 576→64 aggr tokens, LLM 内再路由压缩
+#   - 当前帧: ViT 保持 144 merged tokens, LLM 内路由压缩
+#
 # 微调策略:
-#   - LoRA target modules: qkv, proj, fc1, fc2 (ViT) + q/k/v/o_proj, gate/up/down_proj (LLM)
-#   - Compressor: ~10.5M 随机初始化参数，全参训练
-#   - 可训练参数: ~39.7M (LoRA) + ~10.5M (Compressor) ≈ 50.2M
+#   - LoRA r=32: ViT qkv/proj/fc1/fc2 + LLM q/k/v/o_proj, gate/up/down_proj
+#   - FiLM+DeepStackProj (~109M): 全参训练, LoRA 后 re-unfreeze
+#   - LFP Router: 全参训练, LoRA 后 re-unfreeze
+#   - 可训练: ~39.7M (LoRA) + ~109M (FiLM+Aggr+DSProj) + ~176M (LFP FiLM Router)
 #
-# 数据:
-#   - R2R + RxR (各50%采样)
-#   - Effective batch size: 24 * 4 GPUs * 2 grad_accum = 192
+# 数据: R2R + RxR (各50%)
+# Effective batch: 16 * 4 GPUs * 3 grad_accum = 192
 #
-# GPU: H100 x 4 (GPU 0,1,2,3)
-# 对比基线: Compressor-Baseline-2B-AllLoRA-r32-R2XR50
+# GPU: H100 x 4
+# DeepSpeed: ZeRO-2
 # ============================================
 
 set -e
@@ -27,7 +31,7 @@ export CUDA_VISIBLE_DEVICES=0,1,2,3
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 
 source /data/houdekai/miniconda3/bin/activate internnav
-export WANDB_MODE=offline
+export WANDB_MODE=online
 
 cd /data/houdekai/InternNav_
 
@@ -39,41 +43,54 @@ deepspeed=scripts/train/qwenvl_train/zero2.json
 llm=/data/houdekai/models/Qwen3-VL-2B-Instruct
 vln_datasets="r2r_125cm_0_30%50,rxr_125cm_0_30%50"
 
-batch_size=24
-grad_accum_steps=2  # 24 * 4 * 2 = 192 effective batch
+# Training
+batch_size=16
+grad_accum_steps=3  # 16 * 4 * 3 = 192 effective batch
 
+# LoRA
 use_lora=True
 lora_r=32
 lora_alpha=64
 lora_dropout=0.05
 
+# Compressor (CogVLA-aligned)
 use_compressor=True
-compressor_d_bottleneck=512
-compressor_n_queries=16
-compressor_n_heads=8
-compressor_n_layers=2
+compressor_type=film_vit
+compressor_n_queries=64       # aggr tokens per history image (CogVLA uses 64)
+compressor_n_film_layers=24   # all ViT blocks (same as CogVLA)
+compressor_share_film=False   # independent per block (same as CogVLA)
 
+# LFP (CogVLA-aligned)
+use_lfp=True
+lfp_type="shiftedcos_decay_0.85_0.15"  # cosine decay, max=0.85, min=0.15
+lfp_average_factor=0.5                  # keep 50% visual tokens on average
+lfp_enable_film=True                    # FiLM-conditioned router (same as CogVLA)
+
+# LR
 lr=2e-4
 mm_projector_lr=2e-4
 vision_tower_lr=2e-4
 
+# Image
 min_pixels=3136
 max_pixels=313600
 
+# Data
 num_history=8
 sample_step=4
 num_epochs=2
 
-output_dir="checkpoints/FiLM-Joint-2B-AllLoRA-r32-R2XR50"
-run_name="FiLM_Joint_2B_R2XR50"
+output_dir="checkpoints/FiLM-ViT-LFP-CogVLA-2B-R2XR50-v2"
+run_name="FiLM_ViT_LFP_CogVLA_2B_R2XR50_v2"
 
 mkdir -p ${output_dir}
 
 echo ""
 echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-echo "🚀 FiLM Compressor 联合训练 (Qwen3-VL-2B)"
+echo "  CogVLA-aligned FiLM ViT + LFP (Qwen3-VL-2B)"
 echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-echo "  AllLoRA r=${lora_r} + FiLM Compressor (d_bn=${compressor_d_bottleneck}, n_q=${compressor_n_queries})"
+echo "  LoRA r=${lora_r} + FiLM 24层 + Aggr 64 tokens + LFP FiLM Router"
+echo "  LFP: ${lfp_type}, avg_factor=${lfp_average_factor}, film=${lfp_enable_film}"
 echo "  Batch: ${batch_size} x ${NUM_GPUS} x ${grad_accum_steps} = $(($batch_size * $NUM_GPUS * $grad_accum_steps))"
 echo "  LR: ${lr}, Epochs: ${num_epochs}"
 echo "  Output: ${output_dir}"
@@ -81,6 +98,9 @@ echo "━━━━━━━━━━━━━━━━━━━━━━━━�
 echo ""
 nvidia-smi --query-gpu=index,name,memory.used,memory.total --format=csv | head -10
 echo ""
+
+export NCCL_TIMEOUT=3600
+export TORCH_DISTRIBUTED_DEFAULT_TIMEOUT=3600
 
 torchrun --nnodes=1 --nproc_per_node=${NUM_GPUS} \
     --master_addr=${MASTER_ADDR} --master_port=${MASTER_PORT} \
@@ -97,10 +117,14 @@ torchrun --nnodes=1 --nproc_per_node=${NUM_GPUS} \
     --lora_alpha ${lora_alpha} \
     --lora_dropout ${lora_dropout} \
     --use_compressor ${use_compressor} \
-    --compressor_d_bottleneck ${compressor_d_bottleneck} \
+    --compressor_type ${compressor_type} \
     --compressor_n_queries ${compressor_n_queries} \
-    --compressor_n_heads ${compressor_n_heads} \
-    --compressor_n_layers ${compressor_n_layers} \
+    --compressor_n_film_layers ${compressor_n_film_layers} \
+    --compressor_share_film ${compressor_share_film} \
+    --use_lfp ${use_lfp} \
+    --lfp_type "${lfp_type}" \
+    --lfp_average_factor ${lfp_average_factor} \
+    --lfp_enable_film ${lfp_enable_film} \
     --bf16 True \
     --num_history ${num_history} \
     --data_augmentation True \
@@ -132,16 +156,17 @@ torchrun --nnodes=1 --nproc_per_node=${NUM_GPUS} \
     --logging_steps 1 \
     --model_max_length 8192 \
     --gradient_checkpointing True \
-    --dataloader_num_workers 4 \
+    --dataloader_num_workers 8 \
     --dataloader_persistent_workers True \
     --dataloader_pin_memory True \
-    --dataloader_prefetch_factor 1 \
+    --dataloader_prefetch_factor 2 \
     --seed 42 \
     --data_seed 42 \
     --run_name ${run_name} \
     --remove_unused_columns False \
-    --report_to wandb \
-    --resume_from_checkpoint checkpoints/FiLM-Joint-2B-AllLoRA-r32-R2XR50/checkpoint-2000
+    --report_to wandb
 
 echo ""
-echo "✅ FiLM Compressor 联合训练完成! 模型: ${output_dir}"
+echo "FiLM + LFP 训练完成! 模型: ${output_dir}"
+echo "   compressor 权重: ${output_dir}/compressor_film.safetensors"
+echo "   LFP router 权重: ${output_dir}/lfp_router.safetensors"

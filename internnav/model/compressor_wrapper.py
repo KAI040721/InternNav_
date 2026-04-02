@@ -102,8 +102,14 @@ def make_outer_forward(original_outer_forward):
     """
     @functools.wraps(original_outer_forward)
     def outer_forward_wrapper(self, *args, **kwargs):
-        self._compressor_is_history = kwargs.pop("is_history_image", None)
-        self._compressor_grid_thw_rope = kwargs.pop("image_grid_thw_rope", None)
+        # Pop compressor kwargs if passed explicitly (training path).
+        # If not in kwargs (inference path), preserve any value already set
+        # on the model instance by the caller (e.g. evaluator sets
+        # self.model._compressor_is_history before calling generate()).
+        if "is_history_image" in kwargs:
+            self._compressor_is_history = kwargs.pop("is_history_image")
+        if "image_grid_thw_rope" in kwargs:
+            self._compressor_grid_thw_rope = kwargs.pop("image_grid_thw_rope")
         return original_outer_forward(self, *args, **kwargs)
     return outer_forward_wrapper
 

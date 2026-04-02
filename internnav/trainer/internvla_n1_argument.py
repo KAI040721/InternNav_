@@ -27,10 +27,20 @@ class ModelArguments:
 
     # Compressor相关参数
     use_compressor: bool = field(default=False, metadata={"help": "Whether to use FiLM compressor for history frame compression"})
-    compressor_d_bottleneck: int = field(default=512, metadata={"help": "Compressor bottleneck dimension"})
-    compressor_n_queries: int = field(default=16, metadata={"help": "Number of query tokens after compression (144->16)"})
-    compressor_n_heads: int = field(default=8, metadata={"help": "Number of attention heads in compressor"})
-    compressor_n_layers: int = field(default=2, metadata={"help": "Number of cross-attention layers in compressor"})
+    compressor_type: str = field(default="film_vit", metadata={"help": "Compressor type: 'bottleneck' (old cross-attention) or 'film_vit' (ViT-internal FiLM + aggr tokens)"})
+    compressor_d_bottleneck: int = field(default=512, metadata={"help": "[bottleneck] Compressor bottleneck dimension"})
+    compressor_n_queries: int = field(default=64, metadata={"help": "Number of aggregation tokens per history image (CogVLA uses 64)"})
+    compressor_n_heads: int = field(default=8, metadata={"help": "[bottleneck] Number of attention heads in compressor"})
+    compressor_n_layers: int = field(default=2, metadata={"help": "[bottleneck] Number of cross-attention layers in compressor"})
+    # film_vit specific
+    compressor_n_film_layers: int = field(default=24, metadata={"help": "[film_vit] Number of ViT blocks to apply FiLM (24=all blocks, same as CogVLA)"})
+    compressor_share_film: bool = field(default=False, metadata={"help": "[film_vit] Share FiLM weights across blocks (saves params)"})
+
+    # LFP (Latent Future Prediction) — LLM-side visual token routing (CogVLA-inspired)
+    use_lfp: bool = field(default=False, metadata={"help": "Enable LFP token routing in LLM decoder layers"})
+    lfp_type: str = field(default="shiftedcos_decay_0.85_0.15", metadata={"help": "LFP layer selection/decay type"})
+    lfp_average_factor: float = field(default=0.5, metadata={"help": "LFP base compression ratio (0.5 = keep 50% visual tokens)"})
+    lfp_enable_film: bool = field(default=True, metadata={"help": "Use FiLM-conditioned router (same as CogVLA, text modulates vision token routing)"})
 
 
 @dataclass

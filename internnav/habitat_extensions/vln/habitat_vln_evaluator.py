@@ -14,6 +14,71 @@ from collections import OrderedDict
 import cv2
 import habitat
 import numpy as np
+import math
+
+def _shrink_history_image_tokens(inputs, is_hist, n_queries, image_token_id=151655):
+    """
+    将 input_ids 中历史帧对应的 <image_pad> 占位符从原始数量缩减到 n_queries 个。
+    训练时 dataset 在构建 input_ids 前就把历史帧的 grid_thw 替换成 n_queries，
+    评估时 processor 按原始尺寸生成 input_ids，需要手动对齐。
+
+    Args:
+        inputs: processor 返回的 BatchFeature（包含 input_ids / attention_mask）
+        is_hist: BoolTensor [n_images]，True 表示该帧是历史帧
+        n_queries: 压缩后每帧的 token 数（默认 16）
+        image_token_id: <|image_pad|> 的 token id（Qwen3-VL 默认 151655）
+    Returns:
+        修改后的 inputs（input_ids / attention_mask 已就地替换）
+    """
+    input_ids = inputs["input_ids"][0].tolist()  # [seq_len]
+
+    # 找出每段 image token 的起止位置（连续 image_token_id 构成一段）
+    segments = []  # list of (start, end) exclusive
+    i = 0
+    while i < len(input_ids):
+        if input_ids[i] == image_token_id:
+            j = i
+            while j < len(input_ids) and input_ids[j] == image_token_id:
+                j += 1
+            segments.append((i, j))
+            i = j
+        else:
+            i += 1
+
+    assert len(segments) == len(is_hist), (
+        f"image segments {len(segments)} != is_hist {len(is_hist)}"
+    )
+
+    # 从后往前修改，避免索引偏移
+    new_ids = list(input_ids)
+    for seg_idx in reversed(range(len(segments))):
+        if not is_hist[seg_idx]:
+            continue
+        start, end = segments[seg_idx]
+        orig_len = end - start
+        if orig_len <= n_queries:
+            continue  # 已经 <= n_queries，无需修改
+        # 保留前 n_queries 个，删掉多余的
+        del new_ids[start + n_queries : end]
+
+    new_ids_tensor = torch.tensor([new_ids], dtype=inputs["input_ids"].dtype,
+                                   device=inputs["input_ids"].device)
+    inputs["input_ids"] = new_ids_tensor
+
+    # attention_mask 同步截断到新长度
+    new_len = new_ids_tensor.shape[1]
+    if "attention_mask" in inputs:
+        attn = inputs["attention_mask"]
+        if attn.shape[1] >= new_len:
+            inputs["attention_mask"] = attn[:, :new_len]
+        else:
+            # 极少数情况：pad 到新长度
+            pad = torch.ones(1, new_len - attn.shape[1],
+                             dtype=attn.dtype, device=attn.device)
+            inputs["attention_mask"] = torch.cat([attn, pad], dim=1)
+
+    return inputs
+
 import quaternion
 import torch
 from peft import PeftModel
@@ -157,6 +222,78 @@ class HabitatVLNEvaluator(DistributedEvaluator):
                 model = PeftModel.from_pretrained(base_model, self.model_args.model_path)
                 model = model.merge_and_unload()  # 合并LoRA权重以获得更好的推理性能
                 print("LoRA weights merged successfully")
+
+                # ---- Compressor 加载 ----
+                use_compressor = getattr(self.model_args, 'use_compressor', False)
+                if use_compressor:
+                    from safetensors.torch import load_file as safe_load_file
+                    compressor_type = getattr(self.model_args, 'compressor_type', 'film_vit')
+
+                    if compressor_type == 'film_vit':
+                        from internnav.model.compressor_wrapper_film_vit import attach_compressor_film_vit
+                        compressor_config = {
+                            'n_aggr': getattr(self.model_args, 'compressor_n_queries', 16),
+                            'n_film_layers': getattr(self.model_args, 'compressor_n_film_layers', 24),
+                            'share_film': getattr(self.model_args, 'compressor_share_film', False),
+                        }
+                        model = attach_compressor_film_vit(model, compressor_config)
+                    else:
+                        from internnav.model.compressor_wrapper import attach_compressor
+                        compressor_config = {
+                            'd_model': getattr(self.model_args, 'compressor_d_model', 2048),
+                            'd_bottleneck': getattr(self.model_args, 'compressor_d_bottleneck', 512),
+                            'n_queries': getattr(self.model_args, 'compressor_n_queries', 16),
+                            'n_heads': getattr(self.model_args, 'compressor_n_heads', 8),
+                            'n_layers': getattr(self.model_args, 'compressor_n_layers', 2),
+                        }
+                        model = attach_compressor(model, compressor_config)
+
+                    ckpt_path = self.model_args.compressor_checkpoint
+                    state_dict = safe_load_file(ckpt_path)
+                    model.compressor.load_state_dict(state_dict)
+                    print(f"Compressor [{compressor_type}] weights loaded from {ckpt_path}")
+
+                # ---- LFP Router 加载 ----
+                use_lfp = getattr(self.model_args, 'use_lfp', False)
+                if use_lfp:
+                    from safetensors.torch import load_file as safe_load_file
+                    from internnav.model.lfp_qwen3vl import attach_lfp
+
+                    lfp_ckpt_path = self.model_args.lfp_checkpoint
+                    lfp_state = safe_load_file(lfp_ckpt_path)
+
+                    # 从 checkpoint 自动推断 router 覆盖的 decoder 层，保证评估结构与训练完全一致。
+                    lfp_layer_pattern = re.compile(r"^model\.language_model\.layers\.(\d+)\.router\.")
+                    lfp_layers_from_ckpt = sorted(
+                        {
+                            int(m.group(1))
+                            for k in lfp_state.keys()
+                            for m in [lfp_layer_pattern.match(k)]
+                            if m is not None
+                        }
+                    )
+
+                    lfp_config = {
+                        'lfp_type': getattr(self.model_args, 'lfp_type', 'shiftedcos_decay_0.85_0.15'),
+                        'lfp_average_factor': getattr(self.model_args, 'lfp_average_factor', 0.5),
+                        'lfp_enable_film': getattr(self.model_args, 'lfp_enable_film', True),
+                    }
+                    if lfp_layers_from_ckpt:
+                        lfp_config['lfp_target_layers_override'] = lfp_layers_from_ckpt
+                        print(f"[LFP] Using checkpoint-defined target layers: {lfp_layers_from_ckpt}")
+
+                    model = attach_lfp(model, lfp_config)
+
+                    # 将保存的 router 权重加载到模型对应参数中
+                    model_params = dict(model.named_parameters())
+                    loaded_count = 0
+                    for key, value in lfp_state.items():
+                        if key in model_params:
+                            model_params[key].data.copy_(value.to(model_params[key].dtype))
+                            loaded_count += 1
+                        else:
+                            print(f"[LFP] WARNING: key {key} not found in model")
+                    print(f"LFP Router weights loaded: {loaded_count}/{len(lfp_state)} tensors from {lfp_ckpt_path}")
             else:
                 model = Qwen2_5_VLForConditionalGeneration.from_pretrained(
                     self.model_args.model_path,
@@ -169,6 +306,10 @@ class HabitatVLNEvaluator(DistributedEvaluator):
 
         model.eval()
         self.device = device
+
+        # 保存 compressor 状态供推理时使用
+        self.use_compressor = getattr(self.model_args, 'use_compressor', False)
+        self.compressor_n_queries = getattr(self.model_args, 'compressor_n_queries', 16)
 
         self.model = model
         self.processor = processor
@@ -189,7 +330,6 @@ class HabitatVLNEvaluator(DistributedEvaluator):
             'ahead of you is ',
             'in your sight is ',
         ]
-
         self.actions2idx = OrderedDict(
             {
                 'STOP': [0],
@@ -209,6 +349,26 @@ class HabitatVLNEvaluator(DistributedEvaluator):
         camera_fov_rad = np.deg2rad(self.sim_sensors_config.depth_sensor.hfov)
         self._camera_fov = camera_fov_rad
         self._fx = self._fy = self.sim_sensors_config.depth_sensor.width / (2 * np.tan(camera_fov_rad / 2))
+
+    def _build_content_list_from_text(self, text_with_placeholders, images):
+        """
+        Convert a text string containing <image> placeholders into a
+        content list for Qwen3-VL processor.apply_chat_template().
+
+        Preserves whitespace (spaces, \n) around <image> tokens exactly
+        as they appear in the input string, matching the training tokenization.
+        """
+        import re
+        parts = re.split(r'(<image>)', text_with_placeholders)
+        content = []
+        img_idx = 0
+        for part in parts:
+            if part == '<image>':
+                content.append({"type": "image", "image": images[img_idx]})
+                img_idx += 1
+            elif part:  # keep non-empty text parts WITH their whitespace
+                content.append({"type": "text", "text": part})
+        return content
 
     def eval_action(self):
         """
@@ -736,18 +896,31 @@ class HabitatVLNEvaluator(DistributedEvaluator):
 
                 if len(action_seq) == 0 and goal is None:
                     if action == action_code.LOOKDOWN:
-                        # last action is look down
-                        sources = [{"from": "human", "value": ""}, {"from": "gpt", "value": ""}]
+                        # last action is look down — second turn of pixel-goal dialogue
                         input_images += [look_down_image]
-                        messages.append(
-                            {'role': 'assistant', 'content': [{'type': 'text', 'text': llm_outputs}]}  # noqa: F405
+                        # Build content list for the lookdown turn
+                        # Training format: "{conjunction}<image>."
+                        conj = random.choice(self.conjunctions)
+                        user_content = self._build_content_list_from_text(
+                            f" {conj}<image>.", [look_down_image]
                         )
+                        messages.append(
+                            {'role': 'assistant', 'content': [{'type': 'text', 'text': llm_outputs}]}
+                        )
+                        messages.append({'role': 'user', 'content': user_content})
                         input_img_id = -1
                     else:
-                        sources = copy.deepcopy(self.conversation)
-                        sources[0]["value"] = sources[0]["value"].replace(
-                            '<instruction>.', episode.instruction.instruction_text[:-1]
+                        # Build first-turn user message — must match training exactly
+                        instruction = episode.instruction.instruction_text
+                        # Training template: '...to <instruction>. Where...' -- must add '.' after instruction
+                        base_prompt = (
+                            f"You are an autonomous navigation assistant. "
+                            f"Your task is to {instruction}. "
+                            f"Where should you go next to stay on track? "
+                            f"Please output the next waypoint's coordinates in the image. "
+                            f"Please output STOP when you have successfully completed the task."
                         )
+
                         cur_images = rgb_list[-1:]
                         if step_id == 0:
                             history_id = []
@@ -755,31 +928,78 @@ class HabitatVLNEvaluator(DistributedEvaluator):
                             history_id = np.unique(
                                 np.linspace(0, step_id - 1, self.num_history, dtype=np.int32)
                             ).tolist()
+                            # Training format: " These are your historical observations: <image>\n<image>\n...."
                             placeholder = (DEFAULT_IMAGE_TOKEN + '\n') * len(history_id)
-                            sources[0]["value"] += f' These are your historical observations: {placeholder}.'
+                            base_prompt += f" These are your historical observations: {placeholder}."
 
                         history_id = sorted(history_id)
                         input_images = [rgb_list[i] for i in history_id] + cur_images
                         input_img_id = 0
 
-                    prompt = random.choice(self.conjunctions) + DEFAULT_IMAGE_TOKEN
-                    sources[0]["value"] += f" {prompt}."
-                    prompt_instruction = copy.deepcopy(sources[0]["value"])
-                    parts = split_and_clean(prompt_instruction)
+                        # Training format: " {conjunction}<image>."
+                        conj = random.choice(self.conjunctions)
+                        base_prompt += f" {conj}<image>."
 
-                    content = []
-                    for i in range(len(parts)):
-                        if parts[i] == "<image>":
-                            content.append({"type": "image", "image": input_images[input_img_id]})
-                            input_img_id += 1
-                        else:
-                            content.append({"type": "text", "text": parts[i]})
+                        user_content = self._build_content_list_from_text(
+                            base_prompt, input_images
+                        )
 
-                    messages.append({'role': 'user', 'content': content})
+                        # Fresh conversation with system message (matching training)
+                        messages = [
+                            {'role': 'system', 'content': 'You are a helpful assistant.'},
+                        ]
+                        messages.append({'role': 'user', 'content': user_content})
 
                     text = self.processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
 
                     inputs = self.processor(text=[text], images=input_images, return_tensors="pt").to(self.model.device)
+
+                    # ---- Compressor: 在调用 generate 前直接设置模型属性 ----
+                    # 注意: 不能通过 generate(**kwargs) 传自定义字段，
+                    # 否则 _validate_model_kwargs 会因为参数不在 forward 签名中而 raise ValueError。
+                    # 正确方式: 直接写入 model._compressor_* 属性，
+                    # compressor_forward 会从这里读取并在读后清除。
+                    if self.use_compressor and "image_grid_thw" in inputs:
+                        n_images = inputs["image_grid_thw"].shape[0]
+                        if input_img_id == -1:
+                            # look_down 分支: 只有1张图, 不是历史帧
+                            is_hist = torch.zeros(n_images, dtype=torch.bool)
+                        else:
+                            # 正常分支: 前 len(history_id) 张是历史, 最后1张是当前
+                            n_hist = len(history_id)
+                            is_hist = torch.zeros(n_images, dtype=torch.bool)
+                            is_hist[:n_hist] = True
+
+                        # 构造 image_grid_thw_rope: 压缩后的历史帧用 [1, sq, sq]
+                        # 与训练时 dataset 保持一致: sq = sqrt(n_queries) = 4
+                        # get_rope_index 内部会做 h//merge_size → 4//2=2, 生成 2×2=4 个 visual pos
+                        # 剩余 12 个 image_pad 按文本 token 方式编号 (训练时也是如此)
+                        sq = int(math.sqrt(self.compressor_n_queries))  # 16 -> 4
+                        grid_thw_rope = inputs["image_grid_thw"].clone()
+                        for i in range(n_images):
+                            if is_hist[i]:
+                                grid_thw_rope[i] = torch.tensor([1, sq, sq], dtype=grid_thw_rope.dtype)
+
+                        # 直接写入模型属性 (outer_forward_wrapper 从这里读取)
+                        self.model._compressor_is_history = is_hist
+                        self.model._compressor_grid_thw_rope = grid_thw_rope
+
+                        # 缩减 input_ids 中历史帧的 image token 占位符数量
+                        # processor 按原始尺寸生成 144 个占位符，但 compressor 只输出 n_queries 个
+                        # 必须对齐，否则 get_placeholder_mask 会 raise ValueError
+                        inputs = _shrink_history_image_tokens(
+                            inputs, is_hist, self.compressor_n_queries
+                        )
+
+                    # DEBUG: 打印前3步的 token 数量信息
+                    if step_id < 30 and self.use_compressor and "image_grid_thw" in inputs:
+                        n_img_tokens = (inputs["input_ids"] == 151655).sum().item()
+                        n_images_now = inputs["image_grid_thw"].shape[0]
+                        print(f"[DEBUG] step_id={step_id} n_images={n_images_now} "
+                              f"n_img_tokens_in_ids={n_img_tokens} "
+                              f"is_hist={is_hist.tolist() if 'is_hist' in dir() else 'N/A'} "
+                              f"grid_thw={inputs['image_grid_thw'].tolist()} "
+                              f"input_ids_len={inputs['input_ids'].shape[1]}")
 
                     with torch.no_grad():
                         output_ids = self.model.generate(

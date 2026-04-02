@@ -1,0 +1,513 @@
+"""
+LFP (Latent Future Prediction) Token Router for Qwen3VL
+
+Adapted from CogVLA's modeling_llama.py (LlamaDecoderLFPLayer).
+Replaces certain Qwen3VL LLM decoder layers with LFP variants that
+selectively compress visual tokens during the prefill phase.
+
+Core mechanism:
+  - Each LFP layer has a router that scores tokens (KEEP vs DROP)
+  - Non-visual tokens (text, special) are always kept
+  - Visual tokens are selectively kept via top-K routing
+  - MLP output is weighted by router's KEEP probability
+  - Compression ratios decay per layer (early keep more, later compress more)
+
+Key differences from CogVLA:
+  - Qwen3VL uses Qwen3VLTextDecoderLayer (not LlamaDecoderLayer)
+  - Qwen3VL uses 3D MROPE with position_embeddings (cos, sin) tuple
+  - Qwen3VL returns hidden_states tensor (not tuple) from decoder layer
+  - Visual token positions are identified via visual_pos_mask (not fixed layout)
+  - No action tokens (VLN task, not robot manipulation)
+
+Usage:
+    from internnav.model.lfp_qwen3vl import attach_lfp
+    model = attach_lfp(model, {
+        'lfp_type': 'shiftedcos_decay_0.85_0.15',
+        'lfp_average_factor': 0.5,
+        'lfp_enable_film': False,
+    })
+"""
+
+import re
+import math
+import types
+import functools
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from typing import Optional, Tuple
+
+from transformers.models.qwen3_vl.modeling_qwen3_vl import (
+    Qwen3VLTextDecoderLayer,
+)
+
+
+# ============================================================
+# Decay Functions (same as CogVLA)
+# ============================================================
+
+def shifted_cos_with_ratio(average_ratio, layer_idx, total_layers=28):
+    return math.cos(layer_idx * math.pi / (total_layers - 1)) / 2 + average_ratio
+
+
+def shifted_linear_with_ratio(average_ratio, layer_idx, total_layers=28):
+    return (-layer_idx / (total_layers - 1) + 0.5) + average_ratio
+
+
+DECAY_FUNC_DICT = {
+    "shiftedcos": shifted_cos_with_ratio,
+    "shiftedlinear": shifted_linear_with_ratio,
+}
+
+
+# ============================================================
+# Helper
+# ============================================================
+
+def get_mlp(in_dim, hidden_dim, out_dim, zero_init=False):
+    mlp = nn.Sequential(
+        nn.Linear(in_dim, hidden_dim),
+        nn.GELU(),
+        nn.Linear(hidden_dim, out_dim),
+    )
+    if zero_init:
+        for layer in mlp:
+            if isinstance(layer, nn.Linear):
+                nn.init.zeros_(layer.weight)
+                nn.init.zeros_(layer.bias)
+    return mlp
+
+
+# ============================================================
+# Token Routers (adapted from CogVLA)
+# ============================================================
+
+class TokenRouter(nn.Module):
+    """Simple linear router: hidden_size -> 2 (KEEP vs DROP)."""
+
+    def __init__(self, hidden_size):
+        super().__init__()
+        self.router = nn.Linear(hidden_size, 2)
+        nn.init.zeros_(self.router.weight)
+        nn.init.zeros_(self.router.bias)
+
+    def forward(self, x, visual_pos_mask=None):
+        # [bs, seq_len, dim] -> [bs, seq_len, 2]
+        return self.router(x)
+
+
+class FiLMedTokenRouter(nn.Module):
+    """
+    FiLM-conditioned router: modulates vision tokens using text embedding
+    before routing. Same design as CogVLA's FiLMedTokenRouter, adapted for
+    arbitrary visual token positions (via visual_pos_mask).
+
+    Key difference from CogVLA: scale/shift MLPs and router linear are
+    zero-initialized so FiLM starts as identity (gamma=0, beta=0 => filmed = x)
+    and router starts at 50/50 KEEP/DROP. This prevents gradient explosion from
+    176M randomly-initialized params dominating the gradient norm.
+    """
+
+    def __init__(self, hidden_size):
+        super().__init__()
+        self.router = nn.Linear(hidden_size, 2)
+        nn.init.zeros_(self.router.weight)
+        nn.init.zeros_(self.router.bias)
+        self.scale = get_mlp(hidden_size, hidden_size // 2, hidden_size, zero_init=True)
+        self.shift = get_mlp(hidden_size, hidden_size // 2, hidden_size, zero_init=True)
+
+    def forward(self, x, visual_pos_mask):
+        """
+        Args:
+            x: [bs, seq_len, dim] - layernorm'd hidden states
+            visual_pos_mask: [bs, seq_len] bool - True for visual token positions
+        Returns:
+            [bs, seq_len, 2] - router logits
+        """
+        text_mask = ~visual_pos_mask  # [bs, seq_len]
+
+        # Vectorized text embedding: mean pool over non-visual tokens per batch
+        text_mask_3d = text_mask.unsqueeze(-1).to(dtype=x.dtype)  # [bs, seq_len, 1]
+        text_count = text_mask_3d.sum(dim=1).clamp(min=1)  # [bs, 1]
+        text_hidden = (x * text_mask_3d).sum(dim=1) / text_count  # [bs, dim]
+
+        # FiLM parameters from text
+        gamma = self.scale(text_hidden)  # [bs, dim]
+        beta = self.shift(text_hidden)   # [bs, dim]
+
+        # Apply FiLM to vision tokens only (text tokens unchanged)
+        vis_mask_3d = visual_pos_mask.unsqueeze(-1)  # [bs, seq_len, 1]
+        filmed = x * (1 + gamma.unsqueeze(1)) + beta.unsqueeze(1)
+        filmed_x = torch.where(vis_mask_3d, filmed, x)
+
+        return self.router(filmed_x)
+
+
+# ============================================================
+# LFP Decoder Layer
+# ============================================================
+
+class Qwen3VLDecoderLFPLayer(Qwen3VLTextDecoderLayer):
+    """
+    Qwen3VL decoder layer with Latent Future Prediction (LFP) token routing.
+
+    During prefill:
+      1. Route: compute KEEP score for each token
+      2. Force-select all non-visual tokens
+      3. Top-K select visual tokens by KEEP score
+      4. Run self-attention + MLP on kept tokens only
+      5. Weight MLP output by KEEP score
+      6. Scatter results back to full sequence
+    """
+
+    def __init__(self, config, layer_idx: int, ratio: float = 0.5,
+                 enable_film: bool = False):
+        super().__init__(config, layer_idx)
+        self.router_factor = ratio
+        self._lfp_enable_film = enable_film
+
+        hidden_size = config.hidden_size
+        if enable_film:
+            self.router = FiLMedTokenRouter(hidden_size)
+        else:
+            self.router = TokenRouter(hidden_size)
+
+        # Set by attach_lfp: reference to TextModel for reading visual_pos_mask
+        # Use object.__setattr__ to avoid nn.Module registering it as a submodule
+        # (which would cause circular reference: TextModel -> LFP layer -> TextModel)
+        object.__setattr__(self, '_text_model_ref', None)
+
+    def forward_w_router_weights(
+        self,
+        hidden_states,
+        position_embeddings,
+        attention_mask=None,
+        position_ids=None,
+        past_key_values=None,
+        use_cache=False,
+        cache_position=None,
+        router_weights=None,
+        **kwargs,
+    ):
+        """Forward with router-weighted MLP output."""
+        residual = hidden_states
+        hidden_states = self.input_layernorm(hidden_states)
+
+        # Self Attention
+        hidden_states, _ = self.self_attn(
+            hidden_states=hidden_states,
+            attention_mask=attention_mask,
+            position_ids=position_ids,
+            past_key_values=past_key_values,
+            use_cache=use_cache,
+            cache_position=cache_position,
+            position_embeddings=position_embeddings,
+            **kwargs,
+        )
+        hidden_states = residual + hidden_states
+
+        # MLP with router weighting
+        residual = hidden_states
+        hidden_states = self.post_attention_layernorm(hidden_states)
+        hidden_states = self.mlp(hidden_states) * router_weights.unsqueeze(-1).to(hidden_states.dtype)
+        hidden_states = residual + hidden_states
+
+        return hidden_states
+
+    def forward(
+        self,
+        hidden_states,
+        position_embeddings,
+        attention_mask=None,
+        position_ids=None,
+        past_key_values=None,
+        use_cache=False,
+        cache_position=None,
+        **kwargs,
+    ):
+        # Only apply LFP during prefill (multi-token input)
+        if hidden_states.shape[1] == 1:
+            return super().forward(
+                hidden_states, position_embeddings,
+                attention_mask=attention_mask, position_ids=position_ids,
+                past_key_values=past_key_values, use_cache=use_cache,
+                cache_position=cache_position, **kwargs,
+            )
+
+        # Get visual position mask from TextModel
+        visual_pos_mask = getattr(self._text_model_ref, '_lfp_visual_pos_mask', None)
+        if visual_pos_mask is None:
+            return super().forward(
+                hidden_states, position_embeddings,
+                attention_mask=attention_mask, position_ids=position_ids,
+                past_key_values=past_key_values, use_cache=use_cache,
+                cache_position=cache_position, **kwargs,
+            )
+
+        bs, seq_len, dim = hidden_states.shape
+
+        # Count visual tokens (assume consistent count across batch)
+        num_visual_tokens = visual_pos_mask[0].sum().item()
+        if num_visual_tokens == 0:
+            return super().forward(
+                hidden_states, position_embeddings,
+                attention_mask=attention_mask, position_ids=position_ids,
+                past_key_values=past_key_values, use_cache=use_cache,
+                cache_position=cache_position, **kwargs,
+            )
+
+        # ---- Router ----
+        normed_hidden = self.input_layernorm(hidden_states)
+        router_logits_raw = self.router(normed_hidden, visual_pos_mask)
+        router_weights_all = F.softmax(router_logits_raw, dim=-1)[:, :, 1]  # P(KEEP)
+
+        # Non-visual tokens always get router_weight=1.0 (MLP output not scaled)
+        router_weights_all = torch.where(visual_pos_mask, router_weights_all,
+                                         torch.ones_like(router_weights_all))
+
+        # ---- Inference mode: attention-masked token dropping ----
+        # During training, dropped visual tokens skip the entire layer (attention
+        # + MLP). To exactly match this during inference while keeping KV cache
+        # for all tokens:
+        #   1. Compute the same top-K selection as training
+        #   2. Mask attention so no query can see dropped visual token keys
+        #   3. Zero router weight for dropped tokens (MLP has no effect)
+        #   4. Run full forward (all tokens, but masked + weighted)
+        #   5. Restore dropped tokens' hidden states to their input values
+        #      (same as training: they "skip" this layer entirely)
+        # KV cache is populated for ALL tokens, enabling normal decode steps.
+        # NOTE: We check `past_key_values is not None` instead of `use_cache`
+        # because TextModel.forward consumes `use_cache` and does NOT forward
+        # it to decoder layers; the default is always False here.
+        if past_key_values is not None:
+            # --- Token selection (same logic as training path below) ---
+            visual_kept_length = int(num_visual_tokens * self.router_factor)
+            kept_length = seq_len - (num_visual_tokens - visual_kept_length)
+
+            force_select_mask = torch.zeros_like(router_weights_all)
+            force_select_mask[~visual_pos_mask] = float('inf')
+
+            _, router_indices = torch.topk(
+                router_weights_all + force_select_mask, kept_length, dim=1, sorted=True
+            )
+
+            # Build dropped_mask: True for DROPPED visual tokens
+            dropped_mask = visual_pos_mask.clone()  # all visual positions True
+            dropped_mask.scatter_(1, router_indices, False)  # un-mark kept
+            # Now dropped_mask is True only for visual tokens NOT kept
+
+            # --- Save input hidden states (for restoring dropped positions) ---
+            original_hidden = hidden_states  # safe: forward_w_router_weights
+            # does not modify the input tensor in-place
+
+            # --- Modify attention mask: block keys from dropped visual tokens ---
+            modified_mask = attention_mask
+            if attention_mask is not None and attention_mask.ndim == 4:
+                # attention_mask: (B, H or 1, Q_len, KV_len), additive, -inf = blocked
+                dropped_col = dropped_mask.unsqueeze(1).unsqueeze(2)  # (B,1,1,S)
+                modified_mask = attention_mask.masked_fill(
+                    dropped_col, torch.finfo(attention_mask.dtype).min
+                )
+
+            # --- Zero router weight for dropped tokens ---
+            router_weights_all = router_weights_all.clone()
+            router_weights_all[dropped_mask] = 0.0
+
+            # --- Forward all tokens with modified mask + weights ---
+            outputs = self.forward_w_router_weights(
+                hidden_states,
+                position_embeddings=position_embeddings,
+                attention_mask=modified_mask,
+                position_ids=position_ids,
+                past_key_values=past_key_values,
+                use_cache=use_cache,
+                cache_position=cache_position,
+                router_weights=router_weights_all,
+                **kwargs,
+            )
+
+            # --- Restore dropped positions (they skip layer, like training) ---
+            dropped_3d = dropped_mask.unsqueeze(-1).expand_as(outputs)
+            outputs = torch.where(dropped_3d, original_hidden, outputs)
+
+            return outputs
+
+        # ---- Training mode: token dropping for efficiency ----
+        visual_kept_length = int(num_visual_tokens * self.router_factor)
+        kept_length = seq_len - (num_visual_tokens - visual_kept_length)
+
+        # Force select non-visual tokens via +inf score
+        force_select_mask = torch.zeros_like(router_weights_all)
+        force_select_mask[~visual_pos_mask] = float('inf')
+
+        _, router_indices = torch.topk(
+            router_weights_all + force_select_mask, kept_length, dim=1, sorted=True
+        )
+        router_indices, _ = torch.sort(router_indices, dim=1)
+
+        # Gather kept tokens and their router weights
+        kept_router_weights = torch.gather(router_weights_all, dim=1, index=router_indices)
+        idx_expand = router_indices.unsqueeze(-1).expand(-1, -1, dim)
+        kept_tokens = torch.gather(hidden_states, dim=1, index=idx_expand)
+
+        # Gather position embeddings
+        cos, sin = position_embeddings
+        head_dim = cos.shape[-1]
+        idx_pos = router_indices.unsqueeze(-1).expand(-1, -1, head_dim)
+        kept_cos = torch.gather(cos, dim=1, index=idx_pos)
+        kept_sin = torch.gather(sin, dim=1, index=idx_pos)
+        kept_position_embeddings = (kept_cos, kept_sin)
+
+        # Reconstruct attention mask for kept tokens
+        if attention_mask is not None and attention_mask.ndim == 4:
+            n_heads = attention_mask.shape[1]
+            idx_rows = router_indices.unsqueeze(1).unsqueeze(-1).expand(
+                -1, n_heads, -1, seq_len
+            )
+            kept_mask_rows = torch.gather(attention_mask, dim=2, index=idx_rows)
+            idx_cols = router_indices.unsqueeze(1).unsqueeze(2).expand(
+                -1, n_heads, kept_length, -1
+            )
+            kept_attention_mask = torch.gather(kept_mask_rows, dim=3, index=idx_cols)
+        elif attention_mask is not None and attention_mask.ndim == 2:
+            kept_attention_mask = torch.gather(
+                attention_mask, dim=1, index=router_indices
+            )
+        else:
+            kept_attention_mask = None
+
+        # Forward kept tokens through decoder
+        outputs = self.forward_w_router_weights(
+            kept_tokens,
+            position_embeddings=kept_position_embeddings,
+            attention_mask=kept_attention_mask,
+            position_ids=position_ids,
+            past_key_values=past_key_values,
+            use_cache=use_cache,
+            cache_position=cache_position,
+            router_weights=kept_router_weights,
+            **kwargs,
+        )
+
+        # Scatter back to full sequence
+        hidden_states = hidden_states.scatter(
+            dim=1, index=idx_expand, src=outputs
+        )
+
+        return hidden_states
+
+
+# ============================================================
+# Layer Replacement & Integration
+# ============================================================
+
+def attach_lfp(model, lfp_config=None):
+    """
+    Replace certain Qwen3VL LLM decoder layers with LFP variants.
+
+    Args:
+        model: Qwen3VLForConditionalGeneration instance
+        lfp_config: dict with keys:
+            lfp_type (str): decay type, default 'shiftedcos_decay_0.85_0.15'
+            lfp_average_factor (float): base compression ratio, default 0.5
+            lfp_enable_film (bool): use FiLM-conditioned router, default False
+
+    Returns:
+        model with LFP layers attached
+    """
+    if lfp_config is None:
+        lfp_config = {}
+
+    text_model = model.model.language_model  # Qwen3VLTextModel
+    config = text_model.config
+    num_layers = config.num_hidden_layers
+
+    lfp_type = lfp_config.get('lfp_type', 'shiftedcos_decay_0.85_0.15')
+    avg_factor = lfp_config.get('lfp_average_factor', 0.5)
+    enable_film = lfp_config.get('lfp_enable_film', False)
+    target_layers_override = lfp_config.get('lfp_target_layers_override', None)
+
+    # ---- Compute per-layer compression ratios ----
+    ratios = [avg_factor] * num_layers
+
+    if target_layers_override is not None:
+        lfp_target_layers = sorted(set(int(x) for x in target_layers_override))
+        lfp_target_layers = [i for i in lfp_target_layers if 0 <= i < num_layers]
+        if not lfp_target_layers:
+            raise ValueError("lfp_target_layers_override is empty after filtering valid layer indices")
+    else:
+        DECAY_PATTERN = r"(\w+)_decay_(\d+\.?\d*)_(\d+\.?\d*)"
+        match = re.match(DECAY_PATTERN, lfp_type)
+        if match:
+            decay_name = match.group(1)
+            max_ratio = float(match.group(2))
+            min_ratio = float(match.group(3))
+            decay_func = DECAY_FUNC_DICT[decay_name]
+            ratios = [
+                decay_func(avg_factor, i, num_layers)
+                for i in range(num_layers)
+            ]
+            ratios = [max(r, min_ratio) for r in ratios]
+            lfp_target_layers = [
+                i for i in range(num_layers)
+                if ratios[i] <= max_ratio
+            ]
+        elif lfp_type == "deep_all":
+            lfp_target_layers = list(range(2, num_layers))
+        elif lfp_type == "deep_all_wo_last":
+            lfp_target_layers = list(range(2, num_layers - 1))
+        elif lfp_type == "interleave":
+            lfp_target_layers = list(range(1, num_layers, 2))
+        else:
+            raise NotImplementedError(f"Unsupported lfp_type: {lfp_type}")
+
+    print(f"-------------------------------")
+    print(f"LFP target layers ({len(lfp_target_layers)}/{num_layers}):")
+    for l in lfp_target_layers:
+        print(f"  layer {l}: ratio={ratios[l]:.3f}")
+    print(f"-------------------------------")
+
+    # ---- Replace decoder layers with LFP variants ----
+    ref_param = next(model.parameters())
+    for layer_idx in lfp_target_layers:
+        old_layer = text_model.layers[layer_idx]
+        new_layer = Qwen3VLDecoderLFPLayer(
+            config, layer_idx,
+            ratio=ratios[layer_idx],
+            enable_film=enable_film,
+        )
+        # Copy base decoder weights from original layer
+        old_state = old_layer.state_dict()
+        new_layer.load_state_dict(old_state, strict=False)
+        # Move to same device/dtype
+        new_layer = new_layer.to(device=ref_param.device, dtype=ref_param.dtype)
+        # Set text model reference for visual_pos_mask access
+        # Use object.__setattr__ to avoid nn.Module registering it as a submodule
+        object.__setattr__(new_layer, '_text_model_ref', text_model)
+
+        text_model.layers[layer_idx] = new_layer
+
+    # ---- Monkey-patch TextModel forward to store visual_pos_mask ----
+    original_text_forward = text_model.__class__.forward
+
+    @functools.wraps(original_text_forward)
+    def lfp_text_model_forward(self_tm, *args, **kwargs):
+        visual_pos_masks = kwargs.get('visual_pos_masks', None)
+        self_tm._lfp_visual_pos_mask = visual_pos_masks
+        result = original_text_forward(self_tm, *args, **kwargs)
+        # NOTE: Do NOT clear _lfp_visual_pos_mask here!
+        # With gradient_checkpointing, individual decoder layers are re-run
+        # during backward. If we clear the mask, LFP layers fall through to
+        # super().forward() (no routing) during recomputation, causing a
+        # forward/recompute mismatch and completely wrong gradients (~10^15 norm).
+        # The mask is safely overwritten at the start of each new forward call.
+        return result
+
+    text_model.__class__.forward = lfp_text_model_forward
+
+    # ---- Store metadata ----
+    model._lfp_target_layers = lfp_target_layers
+    model._lfp_config = lfp_config
+
+    return model

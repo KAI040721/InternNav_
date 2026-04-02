@@ -50,6 +50,8 @@ from peft import LoraConfig, get_peft_model, TaskType
 
 # Compressor相关导入
 from internnav.model.compressor_wrapper import attach_compressor
+from internnav.model.compressor_wrapper_film_vit import attach_compressor_film_vit
+from internnav.model.lfp_qwen3vl import attach_lfp
 
 
 def safe_save_model_for_hf_trainer(trainer: transformers.Trainer, output_dir: str):
@@ -293,23 +295,62 @@ def train(attn_implementation="flash_attention_2"):
     # Compressor: 先 attach (monkey-patch forward)，再 apply LoRA
     use_compressor = getattr(model_args, 'use_compressor', False)
     if use_compressor and data_args.model_type == "qwen3vl":
-        compressor_config = {
-            'd_model': 2048,  # Qwen3-VL-2B LLM hidden_size
-            'd_bottleneck': model_args.compressor_d_bottleneck,
-            'n_queries': model_args.compressor_n_queries,
-            'n_heads': model_args.compressor_n_heads,
-            'n_layers': model_args.compressor_n_layers,
-        }
-        model = attach_compressor(model, compressor_config)
-        if torch.distributed.get_rank() == 0:
-            comp_params = sum(p.numel() for p in model.compressor.parameters())
-            print("=" * 50)
-            print(f"Compressor attached: {comp_params/1e6:.2f}M params (randomly initialized)")
-            print(f"  d_bottleneck={model_args.compressor_d_bottleneck}, n_queries={model_args.compressor_n_queries}")
-            print("=" * 50)
+        compressor_type = getattr(model_args, 'compressor_type', 'film_vit')
+        if compressor_type == 'film_vit':
+            # ViT-internal FiLM + Aggregation Tokens (CogVLA-inspired)
+            compressor_config = {
+                'n_aggr': model_args.compressor_n_queries,  # reuse n_queries as n_aggr
+                'n_film_layers': getattr(model_args, 'compressor_n_film_layers', 24),
+                'share_film': getattr(model_args, 'compressor_share_film', False),
+            }
+            model = attach_compressor_film_vit(model, compressor_config)
+            if torch.distributed.get_rank() == 0:
+                comp_params = sum(p.numel() for p in model.compressor.parameters())
+                print("=" * 50)
+                print(f"ViT-FiLM Compressor attached: {comp_params/1e6:.2f}M params")
+                print(f"  n_aggr={model_args.compressor_n_queries}, "
+                      f"n_film_layers={compressor_config['n_film_layers']}, "
+                      f"share_film={compressor_config['share_film']}")
+                print("=" * 50)
+        else:
+            # Original bottleneck cross-attention compressor
+            compressor_config = {
+                'd_model': 2048,
+                'd_bottleneck': model_args.compressor_d_bottleneck,
+                'n_queries': model_args.compressor_n_queries,
+                'n_heads': model_args.compressor_n_heads,
+                'n_layers': model_args.compressor_n_layers,
+            }
+            model = attach_compressor(model, compressor_config)
+            if torch.distributed.get_rank() == 0:
+                comp_params = sum(p.numel() for p in model.compressor.parameters())
+                print("=" * 50)
+                print(f"Bottleneck Compressor attached: {comp_params/1e6:.2f}M params (randomly initialized)")
+                print(f"  d_bottleneck={model_args.compressor_d_bottleneck}, n_queries={model_args.compressor_n_queries}")
+                print("=" * 50)
         # Pass compressor settings to data_args for dataset
         data_args.use_compressor = True
         data_args.compressor_n_queries = model_args.compressor_n_queries
+
+    # LFP: 在 LoRA 之前 attach (LFP layer 拥有 base decoder weights + router)
+    use_lfp = getattr(model_args, 'use_lfp', False)
+    if use_lfp and data_args.model_type == "qwen3vl":
+        lfp_config = {
+            'lfp_type': model_args.lfp_type,
+            'lfp_average_factor': model_args.lfp_average_factor,
+            'lfp_enable_film': model_args.lfp_enable_film,
+        }
+        model = attach_lfp(model, lfp_config)
+        if torch.distributed.get_rank() == 0:
+            lfp_router_params = sum(
+                p.numel() for n, p in model.named_parameters() if "router" in n
+            )
+            print("=" * 50)
+            print(f"LFP attached: {len(model._lfp_target_layers)} layers, "
+                  f"router params={lfp_router_params/1e6:.2f}M")
+            print(f"  type={model_args.lfp_type}, avg_factor={model_args.lfp_average_factor}, "
+                  f"film={model_args.lfp_enable_film}")
+            print("=" * 50)
 
     # 应用LoRA或全参微调
     if use_lora and data_args.model_type == "qwen3vl":
@@ -317,9 +358,11 @@ def train(attn_implementation="flash_attention_2"):
         print("Using Pure LoRA - All base layers frozen, only LoRA adapters trained")
         if use_compressor:
             print("+ Compressor (FiLM) jointly trained")
+        if use_lfp:
+            print("+ LFP Router jointly trained")
         print("=" * 50)
         model = apply_lora_to_qwen3vl(model, model_args)
-        # LoRA冻结了所有base参数，需要重新unfreeze compressor
+        # LoRA冻结了所有base参数，需要重新unfreeze compressor 和 LFP router
         if use_compressor:
             for name, param in model.named_parameters():
                 if "compressor" in name:
@@ -327,6 +370,13 @@ def train(attn_implementation="flash_attention_2"):
             if torch.distributed.get_rank() == 0:
                 comp_trainable = sum(p.numel() for n, p in model.named_parameters() if "compressor" in n and p.requires_grad)
                 print(f"[Compressor] Re-unfrozen after LoRA: {comp_trainable/1e6:.2f}M trainable")
+        if use_lfp:
+            for name, param in model.named_parameters():
+                if ".router." in name:
+                    param.requires_grad = True
+            if torch.distributed.get_rank() == 0:
+                lfp_trainable = sum(p.numel() for n, p in model.named_parameters() if ".router." in n and p.requires_grad)
+                print(f"[LFP] Router re-unfrozen after LoRA: {lfp_trainable/1e6:.2f}M trainable")
     else:
         set_model(model_args, model)
 
@@ -348,6 +398,7 @@ def train(attn_implementation="flash_attention_2"):
     else:
         data_module = make_supervised_data_module(tokenizer=tokenizer, data_args=data_args)
     trainer = Trainer(model=model, processing_class=tokenizer, args=training_args, **data_module)
+
     from tabulate import tabulate
 
     if trainer.is_world_process_zero():
@@ -368,6 +419,7 @@ def train(attn_implementation="flash_attention_2"):
     safe_save_model_for_hf_trainer(trainer=trainer, output_dir=training_args.output_dir)
 
     # 保存 Compressor 权重 (PEFT save_pretrained 不包含它们)
+    # 重要: 使用 DeepSpeed 的 fp32 master weights 保存，而不是 bf16 model state
     if getattr(model_args, 'use_compressor', False):
         import torch.distributed as dist
         if not dist.is_initialized() or dist.get_rank() == 0:
@@ -379,12 +431,68 @@ def train(attn_implementation="flash_attention_2"):
                 base_model = base_model.base_model.model
             if hasattr(base_model, 'compressor'):
                 from safetensors.torch import save_file
-                comp_state = {k: v.cpu() for k, v in base_model.compressor.state_dict().items()}
+
+                # 尝试从 DeepSpeed fp32 master weights 获取 compressor 参数
+                # 这避免了 bf16 截断导致的精度丢失
+                comp_state = {}
+                ds_engine = trainer.model
+                has_fp32 = False
+                if hasattr(ds_engine, 'module'):
+                    # DeepSpeed ZeRO: 检查 fp32 master weights
+                    for name, param in base_model.compressor.named_parameters():
+                        if hasattr(param, '_hp_mapping') and param._hp_mapping is not None:
+                            hp = param._hp_mapping
+                            fp32_data = hp.optim_fragment.narrow(0, hp.lp_frag_address.start, hp.lp_frag_address.numel)
+                            comp_state[name] = fp32_data.reshape(param.shape).cpu().float()
+                            has_fp32 = True
+                        else:
+                            comp_state[name] = param.detach().cpu().float()
+
+                if not has_fp32:
+                    # Fallback: 直接从 model state_dict 获取 (可能是 bf16)
+                    comp_state = {k: v.cpu().float() for k, v in base_model.compressor.state_dict().items()}
+                    print("[Compressor] WARNING: Could not get fp32 master weights, saving model state (may be bf16)")
+
                 save_path = os.path.join(training_args.output_dir, 'compressor_film.safetensors')
                 save_file(comp_state, save_path)
-                print(f"[Compressor] Saved {len(comp_state)} tensors to {save_path}")
+                print(f"[Compressor] Saved {len(comp_state)} tensors to {save_path} (fp32={'YES' if has_fp32 else 'NO'})")
             else:
                 print("[Compressor] WARNING: model has no compressor attribute, skipping save")
+
+    # 保存 LFP Router 权重 (PEFT save_pretrained 不包含它们)
+    if getattr(model_args, 'use_lfp', False):
+        import torch.distributed as dist
+        if not dist.is_initialized() or dist.get_rank() == 0:
+            from safetensors.torch import save_file
+
+            base_model = trainer.model
+            if hasattr(base_model, 'module'):
+                base_model = base_model.module
+            if hasattr(base_model, 'base_model') and hasattr(base_model.base_model, 'model'):
+                base_model = base_model.base_model.model
+
+            lfp_state = {}
+            ds_engine = trainer.model
+            has_fp32 = False
+
+            # 收集所有 LFP router 参数
+            for name, param in base_model.named_parameters():
+                if ".router." in name:
+                    short_name = name  # 保留完整路径用于恢复
+                    if hasattr(ds_engine, 'module') and hasattr(param, '_hp_mapping') and param._hp_mapping is not None:
+                        hp = param._hp_mapping
+                        fp32_data = hp.optim_fragment.narrow(0, hp.lp_frag_address.start, hp.lp_frag_address.numel)
+                        lfp_state[short_name] = fp32_data.reshape(param.shape).cpu().float()
+                        has_fp32 = True
+                    else:
+                        lfp_state[short_name] = param.detach().cpu().float()
+
+            if lfp_state:
+                save_path = os.path.join(training_args.output_dir, 'lfp_router.safetensors')
+                save_file(lfp_state, save_path)
+                print(f"[LFP] Saved {len(lfp_state)} tensors to {save_path} (fp32={'YES' if has_fp32 else 'NO'})")
+            else:
+                print("[LFP] WARNING: no router parameters found, skipping save")
 
 
 if __name__ == "__main__":
